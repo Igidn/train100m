@@ -110,7 +110,7 @@ class LLaMA(nn.Module):
         self.lm_head = nn.Linear(cfg["dim"], cfg["vocab_size"], bias=False)
         self.lm_head.weight = self.tok_emb.weight  # tied
 
-    def forward(self, tokens, targets=None, ce_chunk=8192):
+    def forward(self, tokens, targets=None, ce_chunk=4096):
         """tokens: (B, T) int64. Returns (loss,) if targets given, else logits."""
         bsz, seq = tokens.shape
         cos, sin = rope_cache(seq, self.cfg["head_dim"], self.cfg["rope_theta"],

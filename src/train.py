@@ -16,8 +16,8 @@ and resumes on the next push.
 Env:
   TOK_DATA_DIR      path to tok-mix-v1 root (required)
   PEAK_LR           default 5e-4
-  MICRO_BS          micro-batch size in sequences, default 8
-  ACCUM             grad accumulation micro-steps, default 32
+  MICRO_BS          micro-batch size in sequences, default 4
+  ACCUM             grad accumulation micro-steps, default 64
   SEQ_LEN           default 2048
   CKPT_EVERY        save every N steps, default 1000
   EVAL_EVERY        val loss every N steps, default 250
@@ -141,8 +141,8 @@ def default_hf_repo(token):
 def main():
     data_dir = os.environ["TOK_DATA_DIR"]
     seq_len = int(os.environ.get("SEQ_LEN", 2048))
-    micro_bs = int(os.environ.get("MICRO_BS", 8))
-    accum = int(os.environ.get("ACCUM", 32))
+    micro_bs = int(os.environ.get("MICRO_BS", 4))
+    accum = int(os.environ.get("ACCUM", 64))
     peak_lr = float(os.environ.get("PEAK_LR", 5e-4))
     warmup = int(os.environ.get("WARMUP_STEPS", 200))
     ckpt_every = int(os.environ.get("CKPT_EVERY", 1000))
@@ -160,6 +160,8 @@ def main():
             vocab = json.load(f).get("val", {}).get("vocab", vocab)
 
     torch.manual_seed(1234)
+    dev = torch.cuda.get_device_properties(0)
+    print(f"gpu: {dev.name}, {dev.total_memory/2**30:.1f} GB", flush=True)
     model = LLaMA(vocab_size=vocab, dim=768, n_layers=12, n_heads=12,
                   n_kv_heads=4, head_dim=64, ffn_dim=2048).cuda()
     print(f"params: {model.num_params()/1e6:.1f}M  vocab: {vocab}", flush=True)
