@@ -3,12 +3,12 @@
 Two phases: phase 1 = broad mix (all *-p1-* shards), phase 2 = quality
 anneal (all *-p2-* shards). One LR schedule spans both; phase 2 is the
 final 25% of steps per the data spec. FP16 via Accelerate's fp16 mixed
-precision (T4 has no bf16); the LM head always computes logits in fp32 —
-under fp16 autocast a tied 49k-vocab head pushes logits past 65504 and
-softmax turns inf into NaN. Lion optimizer — peak LR defaults to 3e-4,
-the conservative end of Lion's 3-10x-below-AdamW rule (5e-4 diverged
-before the fp32-head fix).
-Bump via PEAK_LR in the launcher if the loss curve looks too flat.
+precision. AdamW (0.9, 0.95), wd 0.1 on matrices, peak LR 6e-4 — the
+standard ~100M-LLaMA setup; drop PEAK_LR to 3e-4 if the early curve is
+noisy. Grad clip 1.0 (accelerate handles the scaler unscale).
+FP16 via Accelerate's fp16 mixed precision (T4 has no bf16); the LM head
+always computes logits in fp32 — under fp16 autocast a tied 49k-vocab
+head pushes logits past 65504 and softmax turns inf into NaN.
 
 DDP through `accelerate` (not torch.distributed directly): the launcher
 starts this with `accelerate launch --num_processes <n_gpu>`. The token
@@ -21,9 +21,11 @@ run survives Kaggle's 12h session limit and resumes on the next push.
 Env:
   TOK_DATA_DIR      path to tok-mix-v1 root (required)
   TOKENS_PER_STEP   global token budget per optimizer step, default 524288
-  MICRO_BS          micro-batch per GPU in sequences, default 4
+  MICRO_BS          micro-batch per GPU in sequences, default 6 (fits ~14GB
+                    T4 with headroom; drop to 4 if OOM — accum auto-adjusts
+                    to hold TOKENS_PER_STEP invariant)
   SEQ_LEN           default 2048
-  PEAK_LR           default 5e-4
+  PEAK_LR           default 6e-4
   WARMUP_STEPS      default 200
   CKPT_EVERY        save every N steps, default 1000
   EVAL_EVERY        val loss every N steps, default 250
@@ -50,37 +52,7 @@ from src.data import PackedDataset, ValDataset
 from src.model import LLaMA
 
 
-# ---------------------------------------------------------------- Lion
-
-class Lion(torch.optim.Optimizer):
-    """Sign-based update; momentum uses half the memory of AdamW.
-
-    Compatible with fp16 loss scaling: sign(s*g) == sign(g) for any
-    positive scale s, so the scaler cancel-out leaves the direction
-    untouched.
-    """
-
-    def __init__(self, params, lr=1e-4, betas=(0.9, 0.99), weight_decay=0.0):
-        super().__init__(params, dict(lr=lr, betas=betas, weight_decay=weight_decay))
-
-    @torch.no_grad()
-    def step(self, closure=None):
-        for group in self.param_groups:
-            lr, (b1, b2), wd = group["lr"], group["betas"], group["weight_decay"]
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                g = p.grad
-                state = self.state[p]
-                if "m" not in state:
-                    state["m"] = torch.zeros_like(p)
-                m = state["m"]
-                upd = m.mul(b1).add_(g, alpha=1 - b1).sign_()
-                if wd:
-                    p.mul_(1 - lr * wd)
-                p.add_(upd, alpha=-lr)
-                m.mul_(b2).add_(g, alpha=1 - b2)
-
+# ---------------------------------------------------------------- groups
 
 def param_groups(model, wd):
     decay, no_decay = [], []
@@ -152,9 +124,9 @@ def default_hf_repo(token):
 def main():
     data_dir = os.environ["TOK_DATA_DIR"]
     seq_len = int(os.environ.get("SEQ_LEN", 2048))
-    micro_bs = int(os.environ.get("MICRO_BS", 4))
+    micro_bs = int(os.environ.get("MICRO_BS", 6))
     tokens_per_step = int(os.environ.get("TOKENS_PER_STEP", 524288))
-    peak_lr = float(os.environ.get("PEAK_LR", 3e-4))
+    peak_lr = float(os.environ.get("PEAK_LR", 6e-4))
     warmup = int(os.environ.get("WARMUP_STEPS", 200))
     ckpt_every = int(os.environ.get("CKPT_EVERY", 1000))
     eval_every = int(os.environ.get("EVAL_EVERY", 250))
@@ -196,7 +168,8 @@ def main():
                   n_kv_heads=4, head_dim=64, ffn_dim=2048)
     print(f"params: {model.num_params()/1e6:.1f}M  vocab: {vocab}", flush=True)
 
-    opt = Lion(param_groups(model, wd=1.0), lr=peak_lr, betas=(0.9, 0.99))
+    opt = torch.optim.AdamW(param_groups(model, wd=0.1), lr=peak_lr,
+                            betas=(0.9, 0.95))
 
     phase_ds = {1: PackedDataset(data_dir, 1, seq_len),
                 2: PackedDataset(data_dir, 2, seq_len)}
@@ -222,7 +195,8 @@ def main():
                         config=dict(peak_lr=peak_lr, micro_bs=micro_bs, accum=accum,
                                     seq_len=seq_len, tokens_per_step=tokens_per_step,
                                     world_size=world, total_steps=total_steps,
-                                    optimizer="lion", betas=[0.9, 0.99],
+                                    optimizer="adamw", betas=[0.9, 0.95],
+                                    weight_decay=0.1,
                                     precision="fp16 (accelerate)",
                                     params_m=model.num_params() / 1e6, vocab=vocab))
     elif not os.environ.get("WANDB_API_KEY"):
