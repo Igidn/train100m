@@ -3,9 +3,10 @@
 Two phases: phase 1 = broad mix (all *-p1-* shards), phase 2 = quality
 anneal (all *-p2-* shards). One LR schedule spans both; phase 2 is the
 final 25% of steps per the data spec. FP16 via Accelerate's fp16 mixed
-precision (T4 has no bf16), Lion optimizer — Lion conventionally runs
-3-10x smaller LR than AdamW, so default peak is ~5e-4 (AdamW
-3e-3 / 6). Bump via PEAK_LR in the launcher if the loss curve says so.
+precision (T4 has no bf16), Lion optimizer — peak LR defaults to 3e-4,
+the conservative end of Lion's 3-10x-below-AdamW rule (5e-4 diverged:
+fp16 logits overflow into NaN past ~4e-4 on this setup).
+Bump via PEAK_LR in the launcher if the loss curve looks too flat.
 
 DDP through `accelerate` (not torch.distributed directly): the launcher
 starts this with `accelerate launch --num_processes <n_gpu>`. The token
@@ -151,7 +152,7 @@ def main():
     seq_len = int(os.environ.get("SEQ_LEN", 2048))
     micro_bs = int(os.environ.get("MICRO_BS", 4))
     tokens_per_step = int(os.environ.get("TOKENS_PER_STEP", 524288))
-    peak_lr = float(os.environ.get("PEAK_LR", 5e-4))
+    peak_lr = float(os.environ.get("PEAK_LR", 3e-4))
     warmup = int(os.environ.get("WARMUP_STEPS", 200))
     ckpt_every = int(os.environ.get("CKPT_EVERY", 1000))
     eval_every = int(os.environ.get("EVAL_EVERY", 250))
@@ -306,6 +307,7 @@ def main():
     model.train()
     log_every = 1
     next_log = step + 1
+    nan_streak = 0
     t0, tokens_win = time.time(), 0
     stop_clean = False
 
@@ -319,7 +321,7 @@ def main():
         for g in opt.param_groups:
             g["lr"] = lr
 
-        step_loss, n_micro = 0.0, 0
+        step_loss, n_micro, n_skip = 0.0, 0, 0
         for _ in range(accum):
             try:
                 batch = next(it)
@@ -327,6 +329,12 @@ def main():
                 break
             with accelerator.accumulate(model):
                 loss = model(batch[:, :-1], batch[:, 1:])
+                if not torch.isfinite(loss):
+                    # fp16 forward overflow with weights still finite:
+                    # backprop a zero path so this micro contributes nothing
+                    # and the scaler state stays clean
+                    n_skip += 1
+                    loss = loss * 0
                 accelerator.backward(loss)
                 accelerator.clip_grad_norm_(model.parameters(), 1.0)
                 opt.step()
@@ -338,12 +346,22 @@ def main():
         step += 1
         tokens_win += micro_bs * accum * world * seq_len
 
+        if not math.isfinite(step_loss):
+            nan_streak += 1
+        else:
+            nan_streak = 0
+        if nan_streak >= 20:
+            raise SystemExit(f"loss diverged: 20 consecutive non-finite steps "
+                             f"ending at {step}; stopping to save the session quota")
+
         if step >= next_log and n_micro > 0:
             tps = tokens_win / (time.time() - t0)
             v = evaluate() if step % eval_every == 0 else None
             if accelerator.is_main_process:
                 msg = (f"[{step}/{total_steps}] p{phase} loss {step_loss / n_micro:.4f} "
                        f"lr {lr:.2e} {tps / 1e3:.0f}k tok/s")
+                if n_skip:
+                    msg += f" ({n_skip} skip)"
                 if v is not None:
                     msg += f" val {v:.4f}"
                 print(msg, flush=True)
