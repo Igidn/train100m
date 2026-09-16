@@ -27,6 +27,8 @@ Env:
                     accum auto-adjusts to hold TOKENS_PER_STEP invariant)
   SEQ_LEN           default 2048
   PEAK_LR           default 6e-4
+  COMPILE           set to 1 to run the model under dynamo/inductor (opt-in:
+                    adds minutes of warmup and its own failure modes)
   WARMUP_STEPS      default 200
   CKPT_EVERY        save every N steps, default 1000
   EVAL_EVERY        val loss every N steps, default 250
@@ -150,9 +152,13 @@ def main():
     if accum * micro_bs * seq_len * world != tokens_per_step:
         print(f"note: tokens/step rounded to {accum * micro_bs * seq_len * world}", flush=True)
 
+    use_cuda = torch.cuda.is_available()
     accelerator = Accelerator(
-        mixed_precision="fp16" if torch.cuda.is_available() else None,
-        gradient_accumulation_steps=accum)
+        mixed_precision="fp16" if use_cuda else None,
+        gradient_accumulation_steps=accum,
+        # opt-in: dynamo compile adds minutes of warmup and its own failure
+        # modes; validated runs can flip COMPILE=1 in the launcher
+        dynamo_backend="INDUCTOR" if os.environ.get("COMPILE") == "1" else "NO")
 
     vocab = 49154
     mpath = os.path.join(data_dir, "manifest.json")
@@ -164,7 +170,10 @@ def main():
     n_layers = int(os.environ.get("N_LAYERS", 12))
 
     torch.manual_seed(1234)
-    if torch.cuda.is_available():
+    if use_cuda:
+        from torch.backends.cuda import flash_sdp_enabled, math_sdp_enabled, mem_efficient_sdp_enabled
+        print(f"sdpa flags: flash={flash_sdp_enabled()} "
+              f"mem_efficient={mem_efficient_sdp_enabled()} math={math_sdp_enabled()}", flush=True)
         dev = torch.cuda.get_device_properties(0)
         print(f"gpu: {dev.name}, {dev.total_memory / 2**30:.1f} GB "
               f"x {world} ddp | micro={micro_bs} accum={accum}", flush=True)
@@ -175,7 +184,7 @@ def main():
     print(f"params: {model.num_params()/1e6:.1f}M  vocab: {vocab}", flush=True)
 
     opt = torch.optim.AdamW(param_groups(model, wd=0.1), lr=peak_lr,
-                            betas=(0.9, 0.95))
+                            betas=(0.9, 0.95), fused=use_cuda)
 
     phase_ds = {1: PackedDataset(data_dir, 1, seq_len),
                 2: PackedDataset(data_dir, 2, seq_len)}

@@ -4,10 +4,13 @@ Plain decoder-only transformer: RMSNorm, RoPE, GQA, SwiGLU. No KDA, no
 Engram, no MTP — those are for runs 2 and 3. Tied embeddings.
 
 Precision layout (T4 = sm75, fp16 autocast, no bf16):
-- body (norms, rope, linears, SDPA) runs in fp16 tensor cores; rope tables
-  are cached on device and pre-cast to the activation dtype so SDPA never
-  sees mixed q/k/v dtypes (mixed dtypes would silently drop the fused
-  memory-efficient kernel on sm75 and fall back to the fp32 math path).
+- body (norms, rope, linears, SDPA) runs in fp16 tensor cores with the
+  residual stream kept in fp16 too — the fp32 promotion lives only inside
+  RMSNorm's reduction and the CE upcast. This halves elementwise traffic
+  and backward save sizes; rope tables are cached on device and pre-cast
+  to the activation dtype so SDPA never sees mixed q/k/v dtypes (mixed
+  dtypes would silently drop the fused memory-efficient kernel on sm75
+  and fall back to the fp32 math path).
 - LM head matmuls run in fp16 tensor cores; logits are quantized to fp16
   then softmax/CE runs on the fp32 upcast per chunk, and chunk losses are
   summed in fp32 — the fp16-saturating part of the tied-49k-vocab head
@@ -42,10 +45,13 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        # fp32 for the reduction regardless of autocast state
+        # fp32 for the reduction regardless of autocast state; gain and
+        # output go back out in x.dtype so the residual stream stays fp16
+        # under autocast (fp32 here would double elementwise traffic and
+        # backward save sizes for everything downstream)
         out = x.float()
         out = out * torch.rsqrt(out.pow(2).mean(-1, keepdim=True) + self.eps)
-        return (out.to(x.dtype)) * self.weight
+        return out.to(x.dtype) * self.weight.to(x.dtype)
 
 
 def rope_cache(seq_len, head_dim, theta, device, dtype=torch.float32):
@@ -61,6 +67,9 @@ def rotate_half(x):
     return torch.cat([-x2, x1], dim=-1)
 
 
+_SDPA_PROBED = False
+
+
 class Attention(nn.Module):
     def __init__(self, dim, n_heads, n_kv_heads, head_dim, rope_theta, rms_eps):
         super().__init__()
@@ -73,6 +82,7 @@ class Attention(nn.Module):
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
     def forward(self, x, cos, sin):
+        global _SDPA_PROBED
         bsz, seq, _ = x.shape
         q = self.q_proj(x).view(bsz, seq, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(bsz, seq, self.n_kv_heads, self.head_dim).transpose(1, 2)
@@ -87,6 +97,11 @@ class Attention(nn.Module):
         if n_rep > 1:
             k = k.repeat_interleave(n_rep, dim=1)
             v = v.repeat_interleave(n_rep, dim=1)
+        if not _SDPA_PROBED:
+            _SDPA_PROBED = True
+            print(f"[attn probe] q/k/v dtype {q.dtype}, "
+                  f"uniform={q.dtype == k.dtype == v.dtype}, head_dim {self.head_dim}",
+                  flush=True)
         out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         out = out.transpose(1, 2).reshape(bsz, seq, -1)
         return self.o_proj(out)
@@ -152,6 +167,8 @@ class LLaMA(nn.Module):
         """tokens: (B, T) int64. Returns (loss,) if targets given, else logits."""
         bsz, seq = tokens.shape
         x = self.tok_emb(tokens)
+        if x.device.type == "cuda":
+            x = x.half()  # fp16 residual stream; norms still reduce in fp32
         cos, sin = self._rope_tables(seq, tokens.device, x.dtype)
         for blk in self.blocks:
             x = blk(x, cos, sin)
