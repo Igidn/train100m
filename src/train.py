@@ -304,7 +304,7 @@ def main():
 
     # ---- train
     model.train()
-    log_every = 10
+    log_every = 1
     next_log = step + 1
     t0, tokens_win = time.time(), 0
     stop_clean = False
