@@ -255,6 +255,12 @@ def main():
         print(f"resumed: step {step}/{total_steps}, phase {phase}", flush=True)
         del ck
 
+    # move to GPUs + wrap DDP *after* the resume load, so the DDP init
+    # broadcast carries the resumed weights to every rank
+    model, opt = accelerator.prepare(model, opt)
+    if accelerator.is_main_process:
+        print(f"model device: {next(model.parameters()).device}", flush=True)
+
     # ---- data cursors; the shuffle is seeded per epoch, so resume = index offset
     def make_iter(phase, skip_micros=0):
         from torch.utils.data import DataLoader, Subset
