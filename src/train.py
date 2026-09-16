@@ -3,9 +3,11 @@
 Two phases: phase 1 = broad mix (all *-p1-* shards), phase 2 = quality
 anneal (all *-p2-* shards). One LR schedule spans both; phase 2 is the
 final 25% of steps per the data spec. FP16 via Accelerate's fp16 mixed
-precision (T4 has no bf16), Lion optimizer — peak LR defaults to 3e-4,
-the conservative end of Lion's 3-10x-below-AdamW rule (5e-4 diverged:
-fp16 logits overflow into NaN past ~4e-4 on this setup).
+precision (T4 has no bf16); the LM head always computes logits in fp32 —
+under fp16 autocast a tied 49k-vocab head pushes logits past 65504 and
+softmax turns inf into NaN. Lion optimizer — peak LR defaults to 3e-4,
+the conservative end of Lion's 3-10x-below-AdamW rule (5e-4 diverged
+before the fp32-head fix).
 Bump via PEAK_LR in the launcher if the loss curve looks too flat.
 
 DDP through `accelerate` (not torch.distributed directly): the launcher
@@ -307,7 +309,7 @@ def main():
     model.train()
     log_every = 1
     next_log = step + 1
-    nan_streak = 0
+    skip_streak = 0
     t0, tokens_win = time.time(), 0
     stop_clean = False
 
@@ -330,11 +332,15 @@ def main():
             with accelerator.accumulate(model):
                 loss = model(batch[:, :-1], batch[:, 1:])
                 if not torch.isfinite(loss):
-                    # fp16 forward overflow with weights still finite:
-                    # backprop a zero path so this micro contributes nothing
-                    # and the scaler state stays clean
+                    # non-finite forward (fp16 saturation). NaN * 0 is still
+                    # NaN, so rewriting the loss can't clean the graph; if the
+                    # activations themselves went inf, the backward pass
+                    # produces non-finite grads and the GradScaler skips the
+                    # optimizer step and backs off the scale. We must still
+                    # call backward every micro: skipping it would desync the
+                    # DDP allreduce when only some ranks see a NaN batch.
                     n_skip += 1
-                    loss = loss * 0
+                    loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
                 accelerator.backward(loss)
                 accelerator.clip_grad_norm_(model.parameters(), 1.0)
                 opt.step()
@@ -346,12 +352,12 @@ def main():
         step += 1
         tokens_win += micro_bs * accum * world * seq_len
 
-        if not math.isfinite(step_loss):
-            nan_streak += 1
+        if n_skip == accum:
+            skip_streak += 1
         else:
-            nan_streak = 0
-        if nan_streak >= 20:
-            raise SystemExit(f"loss diverged: 20 consecutive non-finite steps "
+            skip_streak = 0
+        if skip_streak >= 20:
+            raise SystemExit(f"loss diverged: 20 consecutive fully-skipped steps "
                              f"ending at {step}; stopping to save the session quota")
 
         if step >= next_log and n_micro > 0:

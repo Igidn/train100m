@@ -132,17 +132,22 @@ class LLaMA(nn.Module):
         for blk in self.blocks:
             x = blk(x, cos, sin)
         x = self.norm(x)
-        if targets is None:
-            return self.lm_head(x)
-        # chunked cross-entropy: keeps the (B*T, vocab) logits tensor small
-        total = x.new_zeros((), dtype=torch.float32)
-        flat_h = x.reshape(-1, x.shape[-1])
-        flat_t = targets.reshape(-1)
-        for i in range(0, flat_h.shape[0], ce_chunk):
-            logits = self.lm_head(flat_h[i:i + ce_chunk])
-            total = total + F.cross_entropy(logits.float(), flat_t[i:i + ce_chunk],
-                                            reduction="sum")
-        return total / flat_t.numel()
+        # head runs in fp32 regardless of autocast state: under fp16, a tied
+        # 49k-vocab head can push logits past 65504 (fp16 max), and softmax
+        # turns inf logits into a NaN loss
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            x = x.float()
+            if targets is None:
+                return self.lm_head(x)
+            # chunked cross-entropy: keeps the (B*T, vocab) logits tensor small
+            total = x.new_zeros(())
+            flat_h = x.reshape(-1, x.shape[-1])
+            flat_t = targets.reshape(-1)
+            for i in range(0, flat_h.shape[0], ce_chunk):
+                logits = self.lm_head(flat_h[i:i + ce_chunk])
+                total = total + F.cross_entropy(logits, flat_t[i:i + ce_chunk],
+                                                reduction="sum")
+            return total / flat_t.numel()
 
     def num_params(self):
         # tied embedding counted once
