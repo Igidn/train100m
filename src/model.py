@@ -67,7 +67,13 @@ class Attention(nn.Module):
         v = self.v_proj(x).view(bsz, seq, self.n_kv_heads, self.head_dim).transpose(1, 2)
         q = q * cos + rotate_half(q) * sin
         k = k * cos + rotate_half(k) * sin
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+        # expand kv heads manually: enable_gqa pushes sm75 SDPA onto the math
+        # backend, which materializes and retains the full fp32 attention matrix
+        n_rep = self.n_heads // self.n_kv_heads
+        if n_rep > 1:
+            k = k.repeat_interleave(n_rep, dim=1)
+            v = v.repeat_interleave(n_rep, dim=1)
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         out = out.transpose(1, 2).reshape(bsz, seq, -1)
         return self.o_proj(out)
 
@@ -109,6 +115,13 @@ class LLaMA(nn.Module):
         self.norm = RMSNorm(cfg["dim"], cfg["rms_eps"])
         self.lm_head = nn.Linear(cfg["dim"], cfg["vocab_size"], bias=False)
         self.lm_head.weight = self.tok_emb.weight  # tied
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        # LLaMA-style: small normal everywhere; nn.Embedding's default std=1
+        # is fatal for a tied head (initial loss was ~ln(V) e+600 instead of ln(V))
+        if isinstance(m, (nn.Linear, nn.Embedding)):
+            nn.init.normal_(m.weight, std=0.02)
 
     def forward(self, tokens, targets=None, ce_chunk=4096):
         """tokens: (B, T) int64. Returns (loss,) if targets given, else logits."""
