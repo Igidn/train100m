@@ -1,3 +1,4 @@
+*.md
 .kaggle/
 __pycache__/
 outputs/
