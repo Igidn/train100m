@@ -2,6 +2,18 @@
 
 Plain decoder-only transformer: RMSNorm, RoPE, GQA, SwiGLU. No KDA, no
 Engram, no MTP — those are for runs 2 and 3. Tied embeddings.
+
+Precision layout (T4 = sm75, fp16 autocast, no bf16):
+- body (norms, rope, linears, SDPA) runs in fp16 tensor cores; rope tables
+  are cached on device and pre-cast to the activation dtype so SDPA never
+  sees mixed q/k/v dtypes (mixed dtypes would silently drop the fused
+  memory-efficient kernel on sm75 and fall back to the fp32 math path).
+- LM head matmuls run in fp16 tensor cores; logits are quantized to fp16
+  then softmax/CE runs on the fp32 upcast per chunk, and chunk losses are
+  summed in fp32 — the fp16-saturating part of the tied-49k-vocab head
+  (softmax over inf logits) still sees fp32 values. A logit past fp16
+  range becomes inf before the upcast, which the train-loop skip path
+  handles by backing off the loss scale.
 """
 
 import math
@@ -65,6 +77,8 @@ class Attention(nn.Module):
         q = self.q_proj(x).view(bsz, seq, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(bsz, seq, self.n_kv_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(bsz, seq, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        # cos/sin arrive pre-cast to x.dtype: fp16 math all the way, so q/k/v
+        # stay fp16 and the fused memory-efficient kernel stays usable on sm75
         q = q * cos + rotate_half(q) * sin
         k = k * cos + rotate_half(k) * sin
         # expand kv heads manually: enable_gqa pushes sm75 SDPA onto the math
@@ -115,7 +129,18 @@ class LLaMA(nn.Module):
         self.norm = RMSNorm(cfg["dim"], cfg["rms_eps"])
         self.lm_head = nn.Linear(cfg["dim"], cfg["vocab_size"], bias=False)
         self.lm_head.weight = self.tok_emb.weight  # tied
+        self._rope = None  # cached (cos, sin) tables
+        self._rope_key = None
         self.apply(self._init_weights)
+
+    def _rope_tables(self, seq, device, dtype):
+        key = (seq, device, dtype)
+        if self._rope_key != key:
+            self._rope = rope_cache(seq, self.cfg["head_dim"], self.cfg["rope_theta"],
+                                    device, torch.float32)
+            self._rope = (self._rope[0].to(dtype), self._rope[1].to(dtype))
+            self._rope_key = key
+        return self._rope
 
     def _init_weights(self, m):
         # LLaMA-style: small normal everywhere; nn.Embedding's default std=1
@@ -126,27 +151,26 @@ class LLaMA(nn.Module):
     def forward(self, tokens, targets=None, ce_chunk=4096):
         """tokens: (B, T) int64. Returns (loss,) if targets given, else logits."""
         bsz, seq = tokens.shape
-        cos, sin = rope_cache(seq, self.cfg["head_dim"], self.cfg["rope_theta"],
-                              tokens.device, torch.float32)
         x = self.tok_emb(tokens)
+        cos, sin = self._rope_tables(seq, tokens.device, x.dtype)
         for blk in self.blocks:
             x = blk(x, cos, sin)
         x = self.norm(x)
-        # head runs in fp32 regardless of autocast state: under fp16, a tied
-        # 49k-vocab head can push logits past 65504 (fp16 max), and softmax
-        # turns inf logits into a NaN loss
         with torch.autocast(device_type=x.device.type, enabled=False):
-            x = x.float()
             if targets is None:
-                return self.lm_head(x)
-            # chunked cross-entropy: keeps the (B*T, vocab) logits tensor small
-            total = x.new_zeros(())
-            flat_h = x.reshape(-1, x.shape[-1])
+                return self.lm_head(x.float())
+            # chunked fp16 head: one weight cast per forward, tensor-core
+            # gemms, fp32 softmax via cross_entropy on the fp32 upcast, and
+            # fp32 summation of the per-chunk losses
+            h = x.half() if x.device.type == "cuda" else x
+            w = self.lm_head.weight.to(h.dtype)
+            total = torch.zeros((), device=h.device, dtype=torch.float32)
+            flat_h = h.reshape(-1, h.shape[-1])
             flat_t = targets.reshape(-1)
             for i in range(0, flat_h.shape[0], ce_chunk):
-                logits = self.lm_head(flat_h[i:i + ce_chunk])
+                logits = F.linear(flat_h[i:i + ce_chunk], w)
                 total = total + F.cross_entropy(logits, flat_t[i:i + ce_chunk],
-                                                reduction="sum")
+                                                reduction="none").float().sum()
             return total / flat_t.numel()
 
     def num_params(self):

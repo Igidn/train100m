@@ -3,12 +3,13 @@
 Two phases: phase 1 = broad mix (all *-p1-* shards), phase 2 = quality
 anneal (all *-p2-* shards). One LR schedule spans both; phase 2 is the
 final 25% of steps per the data spec. FP16 via Accelerate's fp16 mixed
-precision. AdamW (0.9, 0.95), wd 0.1 on matrices, peak LR 6e-4 — the
-standard ~100M-LLaMA setup; drop PEAK_LR to 3e-4 if the early curve is
-noisy. Grad clip 1.0 (accelerate handles the scaler unscale).
+precision (T4 has no bf16). AdamW (0.9, 0.95), wd 0.1 on matrices, peak
+LR 6e-4 — the standard ~100M-LLaMA setup; drop PEAK_LR to 3e-4 if the
+early curve is noisy. Grad clip 1.0 (accelerate unscales before the clip).
 FP16 via Accelerate's fp16 mixed precision (T4 has no bf16); the LM head
-always computes logits in fp32 — under fp16 autocast a tied 49k-vocab
-head pushes logits past 65504 and softmax turns inf into NaN.
+runs its matmuls in fp16 tensor cores and does softmax/CE on the fp32
+upcast in chunks — under plain fp16 the tied 49k-vocab head can push
+logits past 65504 and softmax turns inf into NaN.
 
 DDP through `accelerate` (not torch.distributed directly): the launcher
 starts this with `accelerate launch --num_processes <n_gpu>`. The token
@@ -21,9 +22,9 @@ run survives Kaggle's 12h session limit and resumes on the next push.
 Env:
   TOK_DATA_DIR      path to tok-mix-v1 root (required)
   TOKENS_PER_STEP   global token budget per optimizer step, default 524288
-  MICRO_BS          micro-batch per GPU in sequences, default 6 (fits ~14GB
-                    T4 with headroom; drop to 4 if OOM — accum auto-adjusts
-                    to hold TOKENS_PER_STEP invariant)
+  MICRO_BS          micro-batch per GPU in sequences, default 8 (fp16 head
+                    frees the VRAM the fp32 head used; drop to 6/4 if OOM —
+                    accum auto-adjusts to hold TOKENS_PER_STEP invariant)
   SEQ_LEN           default 2048
   PEAK_LR           default 6e-4
   WARMUP_STEPS      default 200
@@ -124,7 +125,7 @@ def default_hf_repo(token):
 def main():
     data_dir = os.environ["TOK_DATA_DIR"]
     seq_len = int(os.environ.get("SEQ_LEN", 2048))
-    micro_bs = int(os.environ.get("MICRO_BS", 6))
+    micro_bs = int(os.environ.get("MICRO_BS", 8))
     tokens_per_step = int(os.environ.get("TOKENS_PER_STEP", 524288))
     peak_lr = float(os.environ.get("PEAK_LR", 6e-4))
     warmup = int(os.environ.get("WARMUP_STEPS", 200))
@@ -136,10 +137,11 @@ def main():
     hf_repo = os.environ.get("HF_CKPT_REPO") or (default_hf_repo(hf_token) if hf_token else "")
     started = time.time()
 
-    accelerator = Accelerator(
-        mixed_precision="fp16" if torch.cuda.is_available() else None)
-    world = accelerator.num_processes
-
+    # accum must be known before Accelerator construction: it owns the
+    # gradient-accumulation sync (no_sync on non-final micros, one unscale +
+    # step at the end). Without it, sync fires every micro — an all-reduce
+    # and an optimizer step per micro-batch instead of per step.
+    world = torch.cuda.device_count() if torch.cuda.is_available() else 1
     accum = tokens_per_step // (micro_bs * seq_len * world)
     if accum < 1:
         raise SystemExit(
@@ -147,6 +149,10 @@ def main():
             f"({micro_bs * seq_len * world}); raise TOKENS_PER_STEP or lower MICRO_BS")
     if accum * micro_bs * seq_len * world != tokens_per_step:
         print(f"note: tokens/step rounded to {accum * micro_bs * seq_len * world}", flush=True)
+
+    accelerator = Accelerator(
+        mixed_precision="fp16" if torch.cuda.is_available() else None,
+        gradient_accumulation_steps=accum)
 
     vocab = 49154
     mpath = os.path.join(data_dir, "manifest.json")
@@ -297,7 +303,13 @@ def main():
         for g in opt.param_groups:
             g["lr"] = lr
 
-        step_loss, n_micro, n_skip = 0.0, 0, 0
+        # skip/loss counters stay on-GPU during the accumulation loop; one
+        # sync per step instead of one per micro (an .item() forces the host
+        # to drain the launch queue before the next micro can be enqueued)
+        dev = next(model.parameters()).device
+        loss_t = torch.zeros(1, device=dev)
+        skip_t = torch.zeros(1, device=dev, dtype=torch.int32)
+        n_micro = 0
         for _ in range(accum):
             try:
                 batch = next(it)
@@ -305,24 +317,26 @@ def main():
                 break
             with accelerator.accumulate(model):
                 loss = model(batch[:, :-1], batch[:, 1:])
-                if not torch.isfinite(loss):
-                    # non-finite forward (fp16 saturation). NaN * 0 is still
-                    # NaN, so rewriting the loss can't clean the graph; if the
-                    # activations themselves went inf, the backward pass
-                    # produces non-finite grads and the GradScaler skips the
-                    # optimizer step and backs off the scale. We must still
-                    # call backward every micro: skipping it would desync the
-                    # DDP allreduce when only some ranks see a NaN batch.
-                    n_skip += 1
-                    loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
+                skip_t += (~torch.isfinite(loss)).to(torch.int32)
+                # non-finite forward (fp16 saturation). NaN * 0 is still
+                # NaN, so rewriting the loss can't clean the graph; if the
+                # activations themselves went inf, the backward pass
+                # produces non-finite grads and the GradScaler skips the
+                # optimizer step and backs off the scale. We must still
+                # call backward every micro: skipping it would desync the
+                # DDP allreduce when only some ranks see a NaN batch.
+                loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
                 accelerator.backward(loss)
-                accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(model.parameters(), 1.0)
                 opt.step()
                 opt.zero_grad(set_to_none=True)
-            step_loss += accelerator.gather(loss.detach()).mean().item()
+            loss_t += loss.detach()
             n_micro += 1
             micros_done += 1
             tokens_seen += batch.numel() * world
+        step_loss = accelerator.gather(loss_t).mean().item()
+        n_skip = int(skip_t.item())
         step += 1
         tokens_win += micro_bs * accum * world * seq_len
 
