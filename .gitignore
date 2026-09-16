@@ -1,0 +1,4 @@
+.kaggle/
+__pycache__/
+outputs/
+*.pyc
