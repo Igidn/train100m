@@ -3,3 +3,7 @@
 __pycache__/
 outputs/
 *.pyc
+toktest/val-000.bin
+toktest/val-000.offsets.npy
+toktest/tokenizer.json
+toktest/*.log
