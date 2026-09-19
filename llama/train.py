@@ -51,8 +51,8 @@ import numpy as np
 import torch
 from accelerate import Accelerator
 
-from src.data import PackedDataset, ValDataset
-from src.model import LLaMA
+from llama.data import PackedDataset, ValDataset
+from llama.model import LLaMA
 
 
 # ---------------------------------------------------------------- groups
