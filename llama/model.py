@@ -216,11 +216,18 @@ class HybridBlock(nn.Module):
             self.is_kda = False
         self.mlp_norm = RMSNorm(cfg["dim"], cfg["rms_eps"])
         self.mlp = MLP(cfg["dim"], cfg["ffn_dim"])
-        # Full attention materializes the (T+1)^2 score matrix; checkpoint it
-        # so backward recomputes scores instead of storing them (3 layers of
-        # 805MB at micro 8/seq 2048). KDA saves modest fp32 intermediates —
-        # no checkpoint there, the scan recompute would dominate.
-        self.checkpoint_attn = not self.is_kda
+        # Measured at micro 8 / seq 2048 (dim 768, 12x64): an uncheckpointed
+        # KDA sublayer saves ~1.8GB of fp32 intermediates for backward —
+        # q/k/v + conv in/out + all the fp32 kernel internals (ke_pos/ke_neg,
+        # the Ag solve, per-chunk state) — essentially the same as an
+        # uncheckpointed full-attention layer. Nine KDA layers at that rate
+        # is ~16GB before weights/grads/Adam, which OOM'd a 16GB T4 at
+        # initial eval. So checkpoint EVERY attention sublayer, both types:
+        # backward re-runs the scan (~2x KDA fwd compute, acceptable on T4)
+        # and the saved-tensor peak drops to MLP+norm sized. The KDA kernel's
+        # internal autocast(enabled=False) holds inside cp.checkpoint's
+        # recompute, so the fp32-contract fixes stay in force on the re-pass.
+        self.checkpoint_attn = True
 
     def forward(self, x, cos, sin):
         h = self.attn_norm(x)

@@ -27,6 +27,13 @@ gradients checked finite end to end. Conventions follow the fla kernels:
 State S is (K, V) per head (key-first, i.e. S k_v = sum_d k[d] S[d, v]);
 k_t . S means sum over the K axis of S.
 
+AUTOCAST: the whole kernel is fp32 by contract and callers run under fp16
+autocast (accelerate on T4), which downcasts matmul inputs even when they are
+already fp32. kda_chunk_fwd therefore wraps itself in autocast(enabled=False).
+Do not inline or reorder these matmuls without keeping that guard: ke_neg
+design-reaches e^25..e^80 and fp16 max is ~e^11, so one autocast matmul turns
+Ag into inf/NaN (this exact bug NaN'd run 2 at initial eval).
+
 fp32 overflow note: the WY factorization wants exp(C_i) and exp(-C_j)
 separately (C = in-chunk gate cumsum) so the pairwise gate difference
 exp(C_i - C_j) comes out of one matmul. With the fla gate floor of -5 per
@@ -85,6 +92,18 @@ def kda_chunk_fwd(q, k, v, g, beta, return_state=False):
     Returns o (N, T, V), and the final decayed state (N, V, K) if
     return_state (unused at train time; the sequence is one block).
     """
+    n, t, kd = q.shape
+    vd = v.shape[-1]
+    # fp32 kernel, for real this time: callers run under fp16 autocast
+    # (accelerate on T4), and autocast downcasts matmul INPUTS even when they
+    # are already fp32. ke_neg reaches e^25..e^80 by design and e^11 is the
+    # fp16 max, so an autocast matmul here turns Ag into inf/NaN. Nothing in
+    # this function may run under autocast.
+    with torch.autocast(device_type=q.device.type, enabled=False):
+        return _kda_chunk_fwd(q, k, v, g, beta, return_state)
+
+
+def _kda_chunk_fwd(q, k, v, g, beta, return_state=False):
     n, t, kd = q.shape
     vd = v.shape[-1]
     nt = _cdiv(t, CHUNK)
@@ -215,12 +234,15 @@ class KDA(nn.Module):
 
     def _gated_rmsnorm(self, o, gate):
         """RMSNorm over the head_dim axis with a sigmoid gate, per head.
-        fp32 reduction; output cast back so the residual stream stays fp16."""
+        fp32 reduction; output cast back so the residual stream stays fp16.
+        Autocast off: sigmoid on the fp32 gate would be downcast to fp16 and
+        the exp-family ops in here share the kernel's overflow sensitivity."""
         dt = o.dtype
-        of = o.float()
-        gf = gate.float()
-        ms = of.pow(2).mean(-1, keepdim=True) + self.rms_eps
-        out = of * torch.rsqrt(ms) * torch.sigmoid(gf)
+        with torch.autocast(device_type=o.device.type, enabled=False):
+            of = o.float()
+            gf = gate.float()
+            ms = of.pow(2).mean(-1, keepdim=True) + self.rms_eps
+            out = of * torch.rsqrt(ms) * torch.sigmoid(gf)
         return out.to(dt)
 
     def forward(self, x):
@@ -231,15 +253,19 @@ class KDA(nn.Module):
         q, k, v = qkv.split([self.key_dim, self.key_dim, self.value_dim], dim=-1)
 
         # forget gate, fp32: g = -exp(A_log) * softplus(f_b(f_a(x)) + dt_bias)
-        # f_b outputs (H, K) = value_dim channels; A_log broadcasts per head
-        g = self.f_b(self.f_a(x)).float()               # (B, T, H*K)
-        g = g.view(b, t, self.n_heads, self.head_dim)
-        g = g + self.dt_bias.view(1, 1, self.n_heads, self.head_dim).float()
-        g = -torch.exp(self.A_log.view(1, 1, -1, 1).float()) * F.softplus(g)
-        if self.gate_lower_bound is not None:
-            g = g.clamp(min=self.gate_lower_bound)
+        # f_b outputs (H, K) = value_dim channels; A_log broadcasts per head.
+        # Autocast off: the low-rank gate linears run fp32 by contract, and
+        # softplus/exp on autocast fp16 would round the gates toward 0,
+        # corrupting the decay the kernel asserts on (_MAX_CUMSUM_RANGE).
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            g = self.f_b(self.f_a(x.float())).float()         # (B, T, H*K)
+            g = g.view(b, t, self.n_heads, self.head_dim)
+            g = g + self.dt_bias.view(1, 1, self.n_heads, self.head_dim).float()
+            g = -torch.exp(self.A_log.view(1, 1, -1, 1).float()) * F.softplus(g)
+            if self.gate_lower_bound is not None:
+                g = g.clamp(min=self.gate_lower_bound)
 
-        beta = torch.sigmoid(self.b_proj(x).float())  # (B, T, H)
+            beta = torch.sigmoid(self.b_proj(x.float()).float())  # (B, T, H)
 
         # (B, T, H, D) -> (B*T*H, D): heads join the batch for the kernel
         def heads(y, d):

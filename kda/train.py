@@ -18,9 +18,9 @@ HybridModel docstring.
 Env: identical to llama/train.py (TOK_DATA_DIR required; TOKENS_PER_STEP,
 MICRO_BS, SEQ_LEN, PEAK_LR, WARMUP_STEPS, CKPT_EVERY, EVAL_EVERY,
 MAX_HOURS, OUT_DIR, COMPILE, WANDB_*, HF_*), plus:
-  CKPT_SAFETY   set to 0 to skip gradient checkpointing on the full-attention
-                sublayers (faster if VRAM allows; default on for the score
-                matrix, KDA layers never checkpointed)
+  CKPT_SAFETY   set to 0 to skip gradient checkpointing on ALL attention
+                sublayers, KDA and full-attention alike (faster if VRAM
+                allows; default on — see HybridBlock.checkpoint_attn)
   HF_CKPT_REPO  default <whoami>/tinyballs-v1-kda (separate repo from run 1)
 """
 
@@ -177,9 +177,13 @@ def main():
         head_dim = 32
     model = HybridModel(vocab_size=vocab, dim=dim, n_layers=n_layers, n_heads=n_heads,
                         n_kv_heads=max(1, n_heads // 3), head_dim=head_dim, ffn_dim=2048)
-    if os.environ.get("CKPT_SAFETY", "1") != "0":
+    # test knob; production default keeps HybridBlock.checkpoint_attn (True
+    # for every attention sublayer, KDA and full-attention alike — the KDA
+    # scan saves ~1.8GB of fp32 intermediates per layer at micro 8/seq 2048
+    # and OOM'd 16GB T4s without checkpointing)
+    if os.environ.get("CKPT_SAFETY", "1") == "0":
         for blk in model.blocks:
-            blk.checkpoint_attn = not blk.is_kda
+            blk.checkpoint_attn = False
     print(f"params: {model.num_params()/1e6:.1f}M  vocab: {vocab}", flush=True)
 
     opt = torch.optim.AdamW(param_groups(model, wd=0.1), lr=peak_lr,
