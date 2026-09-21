@@ -40,6 +40,13 @@ DEFAULTS = dict(
     # run 2 hybrid pattern (layer indices, 0-based): KDA at 1-3, 5-7, 9-11
     # (1-indexed 2-4, 6-8, 10-12); full attention at 0, 4, 8
     kda_layers=(1, 2, 3, 5, 6, 7, 9, 10, 11),
+    # attn_impl: "sdpa_mask" (fused SDPA, sink via additive mask — exact old
+    # math) | "sdpa" (fused, no sink — ablation, fresh run only) | "manual"
+    # (old materialized path, bitwise A/B)
+    attn_impl="sdpa_mask",
+    # kda_impl: "fla" (Triton kernels from flash-linear-attention; train.py
+    # resolves + validates this at startup) | "torch" (pure-PyTorch scan)
+    kda_impl="fla",
 )
 
 
@@ -144,6 +151,9 @@ class Block(nn.Module):
         return x
 
 
+SDPA_PAD = 8  # mem-efficient kernel wants the mask's last dim 8-aligned
+
+
 class FullAttention(nn.Module):
     """Run 2 full-attention layer: GQA + QK-norm + learned sink + output
     gate, NoPE. QK-norm (RMSNorm over head_dim on q and k) keeps logits in a
@@ -152,16 +162,38 @@ class FullAttention(nn.Module):
     standard learned-attention-sink of the 2026 stacks. Output gate mirrors
     the KDA layers so both sublayers gate their output the same way.
 
-    Attention materializes the (T+1) score matrix — the sink can't ride on
-    SDPA — so the sublayer is gradient-checkpointed by the block to keep
-    activation memory at SDPA levels.
+    The first version computed scores, softmax and probs@v by hand over the
+    full (B, H, T, T+1) matrix just to carry the sink column — ~1.7GB of
+    saved activations per layer at micro 8/seq 2048, which is what forced
+    gradient checkpointing on every attention sublayer — and, worse, it had
+    NO CAUSAL MASK: position t could attend to t+1 and see the token it was
+    being trained to predict (the LLaMA baseline was immune — SDPA
+    is_causal — but all 3 full-attention layers of the hybrid leaked). It
+    now runs on fused SDPA with the sink folded into an additive mask: an
+    extra dummy key column (zero key, zero value) whose logit is the learned
+    per-head sink, masked causally over the real keys. No materialized score
+    matrix, causal by construction, and the memory-efficient kernel engages
+    on sm75 — so the full-attention sublayers run without checkpointing.
+
+    impl:
+      "sdpa_mask" (default) — fused SDPA, sink in the mask, exact old math.
+      "sdpa"                — fused SDPA, sink dropped entirely (the softmax
+                              denominator changes: probs are renormalized
+                              over T instead of T+1). Ablation only; needs a
+                              fresh run since the attn_sink param is absent.
+      "manual"              — the old materialized path, kept for bitwise
+                              A/B against sdpa_mask.
     """
 
-    def __init__(self, dim, n_heads, n_kv_heads, head_dim, rms_eps):
+    def __init__(self, dim, n_heads, n_kv_heads, head_dim, rms_eps,
+                 impl="sdpa_mask"):
         super().__init__()
+        if impl not in ("sdpa_mask", "sdpa", "manual"):
+            raise ValueError(f"unknown ATTN_IMPL {impl}")
         self.n_heads = n_heads
         self.n_kv_heads = n_kv_heads
         self.head_dim = head_dim
+        self.impl = impl
         self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
         self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
         self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
@@ -170,10 +202,34 @@ class FullAttention(nn.Module):
         self.q_norm = RMSNorm(head_dim, rms_eps)
         self.k_norm = RMSNorm(head_dim, rms_eps)
         # learned sink logit per q head (init 0: e^0 = 1 unit of softmax mass)
-        self.attn_sink = nn.Parameter(torch.zeros(n_heads))
+        self.attn_sink = None if impl == "sdpa" else nn.Parameter(torch.zeros(n_heads))
         self.o_gate = nn.Linear(dim, dim, bias=False)
+        # structural mask template, cached: causal over the real keys, sink
+        # column open, pad columns closed. The learned sink logit is added to
+        # its column per call (the template itself holds no learned values).
+        self._mask = None
+        self._mask_key = None
+        self._manual_fallback = impl == "manual"
 
-    def forward(self, x):
+    def _sink_mask(self, seq, device, dtype):
+        """(1, 1, seq, seq+1+SDPA_PAD) additive mask template. Causal over
+        the real keys, sink column open (its learned logit is added per
+        call), pad columns closed so the padded dummy keys are unreachable."""
+        key = (seq, device, dtype)
+        if self._mask_key != key:
+            tot = seq + 1 + SDPA_PAD
+            m = torch.zeros(1, 1, seq, tot, dtype=dtype, device=device)
+            causal = torch.ones(seq, seq + 1, dtype=torch.bool, device=device).tril()
+            m[..., :seq + 1].masked_fill_(~causal, float("-inf"))
+            # the causal fill closed the sink column too (tril over (seq,
+            # seq+1) masks col seq for every query) — reopen it: the sink is
+            # visible to all queries, its logit is added per call
+            m[..., seq] = 0.0
+            m[..., seq + 1:] = float("-inf")
+            self._mask, self._mask_key = m, key
+        return self._mask
+
+    def _scores(self, x):
         bsz, seq, _ = x.shape
         q = self.q_proj(x).view(bsz, seq, self.n_heads, self.head_dim)
         k = self.k_proj(x).view(bsz, seq, self.n_kv_heads, self.head_dim)
@@ -183,16 +239,62 @@ class FullAttention(nn.Module):
         v = v.transpose(1, 2)
         n_rep = self.n_heads // self.n_kv_heads
         if n_rep > 1:
+            # expand kv heads manually: enable_gqa pushes sm75 SDPA onto the
+            # math backend, which materializes and retains the full fp32
+            # attention matrix
             k = k.repeat_interleave(n_rep, dim=1)
             v = v.repeat_interleave(n_rep, dim=1)
+        return q, k, v, bsz, seq
+
+    def forward(self, x):
+        q, k, v, bsz, seq = self._scores(x)
+        if self._manual_fallback:
+            out = self._manual(q, k, v, bsz, seq)
+        elif self.attn_sink is None:
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            try:
+                out = self._fused_sink(q, k, v, bsz, seq)
+            except RuntimeError as e:
+                # backend rejected the mask (version-dependent bias support
+                # on sm75): fall back rather than kill the run; OOM surfaces
+                # as a RuntimeError too, and the manual path was proven to
+                # fit (it is what the run used before this change)
+                print(f"[attn] fused sink path failed ({type(e).__name__}: {e}); "
+                      f"falling back to the manual softmax", flush=True)
+                self._manual_fallback = True
+                out = self._manual(q, k, v, bsz, seq)
+        out = out.transpose(1, 2).reshape(bsz, seq, -1)
+        return self.o_proj(torch.sigmoid(self.o_gate(x)) * out)
+
+    def _fused_sink(self, q, k, v, bsz, seq):
+        # dummy kv: one sink entry (zero key, zero value) + SDPA_PAD fillers,
+        # so the mask's last dim is 8-aligned for the mem-efficient kernel
+        pad = torch.zeros(bsz, self.n_heads, 1 + SDPA_PAD, self.head_dim,
+                          dtype=q.dtype, device=q.device)
+        k = torch.cat([k, pad], dim=2)
+        v = torch.cat([v, pad], dim=2)
+        base = self._sink_mask(seq, q.device, q.dtype).expand(
+            1, self.n_heads, seq, -1).clone()  # (1, H, seq, seq+1+PAD)
+        # learned per-head sink logit rides only on the sink column; -inf
+        # entries elsewhere are unaffected by the index write
+        base[:, :, :, seq] = self.attn_sink.to(q.dtype).view(1, -1, 1)
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=base)
+
+    def _manual(self, q, k, v, bsz, seq):
+        # dense reference: explicit causal mask + sink column. Kept for
+        # bitwise A/B against the fused path. Note the pre-rewrite version of
+        # this layer had NO causal mask at all — position t could attend to
+        # t+1 and directly see the token it was being trained to predict.
+        # That leak is fixed everywhere now and deliberately not preserved.
         scores = q @ k.transpose(-1, -2) * self.head_dim ** -0.5  # (B, H, T, T)
+        causal = torch.ones(seq, seq, dtype=torch.bool, device=scores.device).tril()
+        scores = scores.masked_fill(~causal, float("-inf"))
         # sink column: constant logit per head, no value contribution
         sink = self.attn_sink.to(scores.dtype).view(1, -1, 1, 1)
         scores = torch.cat([scores, sink.expand(bsz, -1, seq, 1)], dim=-1)
         probs = F.softmax(scores, dim=-1)[..., :-1]  # drop sink column
-        out = probs @ v
-        out = out.transpose(1, 2).reshape(bsz, seq, -1)
-        return self.o_proj(torch.sigmoid(self.o_gate(x)) * out)
+        return probs @ v
 
 
 class HybridBlock(nn.Module):
@@ -207,27 +309,28 @@ class HybridBlock(nn.Module):
         self.attn_norm = RMSNorm(cfg["dim"], cfg["rms_eps"])
         if layer_idx in cfg["kda_layers"]:
             self.attn = KDA(cfg["dim"], n_heads=cfg["n_heads"],
-                            head_dim=cfg["head_dim"])
+                            head_dim=cfg["head_dim"], impl=cfg["kda_impl"])
             self.is_kda = True
         else:
             self.attn = FullAttention(cfg["dim"], cfg["n_heads"],
                                       cfg["n_kv_heads"], cfg["head_dim"],
-                                      cfg["rms_eps"])
+                                      cfg["rms_eps"], impl=cfg["attn_impl"])
             self.is_kda = False
         self.mlp_norm = RMSNorm(cfg["dim"], cfg["rms_eps"])
         self.mlp = MLP(cfg["dim"], cfg["ffn_dim"])
-        # Measured at micro 8 / seq 2048 (dim 768, 12x64): an uncheckpointed
-        # KDA sublayer saves ~1.8GB of fp32 intermediates for backward —
-        # q/k/v + conv in/out + all the fp32 kernel internals (ke_pos/ke_neg,
-        # the Ag solve, per-chunk state) — essentially the same as an
-        # uncheckpointed full-attention layer. Nine KDA layers at that rate
-        # is ~16GB before weights/grads/Adam, which OOM'd a 16GB T4 at
-        # initial eval. So checkpoint EVERY attention sublayer, both types:
-        # backward re-runs the scan (~2x KDA fwd compute, acceptable on T4)
-        # and the saved-tensor peak drops to MLP+norm sized. The KDA kernel's
-        # internal autocast(enabled=False) holds inside cp.checkpoint's
-        # recompute, so the fp32-contract fixes stay in force on the re-pass.
-        self.checkpoint_attn = True
+        # Sublayer gradient checkpointing policy. The torch KDA scan saves
+        # ~1.8GB of fp32 intermediates per layer at micro 8/seq 2048 (q/k/v +
+        # conv + the fp32 kernel internals) and OOM'd 16GB T4s uncheckpointed,
+        # so torch-KDA sublayers checkpoint (backward re-runs the scan, ~2x
+        # KDA fwd compute). With the fla backend the kernel manages its own
+        # memory (chunk-level recompute in Triton, no fp32 intermediates in
+        # HBM), so fla-KDA runs uncheckpointed. Full attention runs on fused
+        # SDPA now (no (B,H,T,T) tensors) and never needs checkpointing; the
+        # manual fallback keeps it checkpointed since it materializes scores.
+        # CKPT_SAFETY=0 in the trainer disables checkpointing on ALL
+        # attention sublayers regardless.
+        self.checkpoint_attn = (self.is_kda and cfg["kda_impl"] != "fla") or \
+                               (not self.is_kda and cfg["attn_impl"] == "manual")
 
     def forward(self, x, cos, sin):
         h = self.attn_norm(x)

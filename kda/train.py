@@ -22,6 +22,22 @@ MAX_HOURS, OUT_DIR, COMPILE, WANDB_*, HF_*), plus:
                 sublayers, KDA and full-attention alike (faster if VRAM
                 allows; default on — see HybridBlock.checkpoint_attn)
   HF_CKPT_REPO  default <whoami>/tinyballs-v1-kda (separate repo from run 1)
+  KDA_IMPL      KDA scan backend: "auto" (default; try the flash-linear-
+                attention Triton kernels, validate against the pure-PyTorch
+                scan, fall back on any mismatch), "torch" (pure PyTorch),
+                or "fla" (require fla; fail loudly if it doesn't validate).
+                fla needs: pip install flash-linear-attention (the launcher
+                installs it). fla removes the per-chunk python loop and the
+                fp32 scan intermediates, so KDA sublayers also skip gradient
+                checkpointing — the biggest single throughput lever here.
+  KDA_CKPT      set to 1 to force sublayer checkpointing on KDA even with the
+                fla backend (if fla's saved activations exceed VRAM)
+  ATTN_IMPL     full-attention path: "sdpa_mask" (default; fused SDPA, sink
+                via additive mask — exact old math), "sdpa" (fused, no sink;
+                ablation, fresh run only), "manual" (old materialized path,
+                bitwise A/B)
+  PROFILE_STEP  step number to profile with torch.profiler (one full step,
+                top-25 CUDA ops table to stdout; 0 = off)
 """
 
 import json
@@ -38,6 +54,7 @@ import torch
 from accelerate import Accelerator
 
 from llama.data import PackedDataset, ValDataset
+from llama.kda import resolve_kda_impl
 from llama.model import HybridModel
 
 CKPT_REPO_SUFFIX = "tinyballs-v1-kda"
@@ -148,6 +165,10 @@ def main():
         # opt-in: dynamo compile adds minutes of warmup and its own failure
         # modes; validated runs can flip COMPILE=1 in the launcher
         dynamo_backend="INDUCTOR" if os.environ.get("COMPILE") == "1" else "NO")
+    if use_cuda:
+        # ShortConv hits cudnn with the same shapes every micro; let cudnn
+        # pick and cache the fastest algorithm instead of the heuristic
+        torch.backends.cudnn.benchmark = True
 
     vocab = 49154
     mpath = os.path.join(data_dir, "manifest.json")
@@ -175,15 +196,30 @@ def main():
     if n_heads * head_dim != dim:
         n_heads = max(1, dim // 32)
         head_dim = 32
+    # KDA backend resolved + validated up front (fla Triton vs pure PyTorch),
+    # before model construction so HybridBlock's checkpoint policy matches
+    # the impl actually in use
+    if use_cuda:
+        kda_impl = resolve_kda_impl(os.environ.get("KDA_IMPL", "auto"),
+                                    torch.device("cuda"))
+    else:
+        if os.environ.get("KDA_IMPL", "auto") == "fla":
+            raise SystemExit("KDA_IMPL=fla needs CUDA; unset it for cpu smoke tests")
+        kda_impl = "torch"
+    attn_impl = os.environ.get("ATTN_IMPL", "sdpa_mask")
     model = HybridModel(vocab_size=vocab, dim=dim, n_layers=n_layers, n_heads=n_heads,
-                        n_kv_heads=max(1, n_heads // 3), head_dim=head_dim, ffn_dim=2048)
-    # test knob; production default keeps HybridBlock.checkpoint_attn (True
-    # for every attention sublayer, KDA and full-attention alike — the KDA
-    # scan saves ~1.8GB of fp32 intermediates per layer at micro 8/seq 2048
-    # and OOM'd 16GB T4s without checkpointing)
+                        n_kv_heads=max(1, n_heads // 3), head_dim=head_dim, ffn_dim=2048,
+                        kda_impl=kda_impl, attn_impl=attn_impl)
     if os.environ.get("CKPT_SAFETY", "1") == "0":
         for blk in model.blocks:
             blk.checkpoint_attn = False
+    if os.environ.get("KDA_CKPT") == "1":
+        for blk in model.blocks:
+            if blk.is_kda:
+                blk.checkpoint_attn = True
+    print(f"kda_impl: {kda_impl} | attn_impl: {attn_impl} | "
+          f"ckpt_attn per block: "
+          f"{[int(b.checkpoint_attn) for b in model.blocks]}", flush=True)
     print(f"params: {model.num_params()/1e6:.1f}M  vocab: {vocab}", flush=True)
 
     opt = torch.optim.AdamW(param_groups(model, wd=0.1), lr=peak_lr,
@@ -306,6 +342,12 @@ def main():
     skip_streak = 0
     t0, tokens_win = time.time(), 0
     stop_clean = False
+    # PROFILE_STEP=N: one full training step gets torch.profiler'd and a
+    # top-25-by-CUDA-time table lands in stdout — the session-cheap way to
+    # find out where the tokens/s actually go
+    profile_at = int(os.environ.get("PROFILE_STEP", 0))
+
+    from contextlib import nullcontext
 
     while step < total_steps and not stop_clean:
         if phase == 1 and step >= phase2_start:
@@ -317,42 +359,54 @@ def main():
         for g in opt.param_groups:
             g["lr"] = lr
 
-        # skip/loss counters stay on-GPU during the accumulation loop; one
-        # sync per step instead of one per micro (an .item() forces the host
-        # to drain the launch queue before the next micro can be enqueued)
-        dev = next(model.parameters()).device
-        loss_t = torch.zeros(1, device=dev)
-        skip_t = torch.zeros(1, device=dev, dtype=torch.int32)
-        n_micro = 0
-        for _ in range(accum):
-            try:
-                batch = next(it)
-            except StopIteration:
-                break
-            with accelerator.accumulate(model):
-                loss = model(batch[:, :-1], batch[:, 1:])
-                skip_t += (~torch.isfinite(loss)).to(torch.int32)
-                # non-finite forward (fp16 saturation). NaN * 0 is still
-                # NaN, so rewriting the loss can't clean the graph; if the
-                # activations themselves went inf, the backward pass
-                # produces non-finite grads and the GradScaler skips the
-                # optimizer step and backs off the scale. We must still
-                # call backward every micro: skipping it would desync the
-                # DDP allreduce when only some ranks see a NaN batch.
-                loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
-                accelerator.backward(loss)
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(model.parameters(), 1.0)
-                opt.step()
-                opt.zero_grad(set_to_none=True)
-            loss_t += loss.detach()
-            n_micro += 1
-            micros_done += 1
-            tokens_seen += batch.numel() * world
+        if profile_at and step == profile_at and accelerator.is_main_process:
+            from torch.profiler import profile, ProfilerActivity
+            prof_ctx = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA])
+            print(f"[profile] profiling step {step} (PROFILE_STEP) ...", flush=True)
+        else:
+            prof_ctx = nullcontext()
+
+        with prof_ctx:
+            # skip/loss counters stay on-GPU during the accumulation loop; one
+            # sync per step instead of one per micro (an .item() forces the host
+            # to drain the launch queue before the next micro can be enqueued)
+            dev = next(model.parameters()).device
+            loss_t = torch.zeros(1, device=dev)
+            skip_t = torch.zeros(1, device=dev, dtype=torch.int32)
+            n_micro = 0
+            for _ in range(accum):
+                try:
+                    batch = next(it)
+                except StopIteration:
+                    break
+                with accelerator.accumulate(model):
+                    loss = model(batch[:, :-1], batch[:, 1:])
+                    skip_t += (~torch.isfinite(loss)).to(torch.int32)
+                    # non-finite forward (fp16 saturation). NaN * 0 is still
+                    # NaN, so rewriting the loss can't clean the graph; if the
+                    # activations themselves went inf, the backward pass
+                    # produces non-finite grads and the GradScaler skips the
+                    # optimizer step and backs off the scale. We must still
+                    # call backward every micro: skipping it would desync the
+                    # DDP allreduce when only some ranks see a NaN batch.
+                    loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
+                    accelerator.backward(loss)
+                    if accelerator.sync_gradients:
+                        accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                    opt.step()
+                    opt.zero_grad(set_to_none=True)
+                loss_t += loss.detach()
+                n_micro += 1
+                micros_done += 1
+                tokens_seen += batch.numel() * world
         step_loss = accelerator.gather(loss_t).mean().item()
         n_skip = int(skip_t.item())
         step += 1
         tokens_win += micro_bs * accum * world * seq_len
+
+        if profile_at and step == profile_at + 1 and accelerator.is_main_process:
+            print(prof_ctx.key_averages().table(
+                sort_by="cuda_time_total", row_limit=25), flush=True)
 
         if n_skip == accum:
             skip_streak += 1
