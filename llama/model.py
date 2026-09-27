@@ -37,6 +37,9 @@ DEFAULTS = dict(
     ffn_dim=2048,
     rope_theta=10000.0,
     rms_eps=1e-5,
+    # gradient-checkpoint every block (SFT at long seq on 16GB T4s needs it;
+    # pretrain never sets it, so the run-1/2 recipes are unchanged)
+    grad_ckpt=False,
     # run 2 hybrid pattern (layer indices, 0-based): KDA at 1-3, 5-7, 9-11
     # (1-indexed 2-4, 6-8, 10-12); full attention at 0, 4, 8
     kda_layers=(1, 2, 3, 5, 6, 7, 9, 10, 11),
@@ -377,7 +380,7 @@ class HybridModel(nn.Module):
         self.apply(self._init_weights)
 
     def _rope_tables(self, seq, device, dtype):
-        key = (seq, device, dtype)
+        key = (seq, self.cfg["rope_theta"], device, dtype)
         if self._rope_key != key:
             self._rope = rope_cache(seq, self.cfg["head_dim"], self.cfg["rope_theta"],
                                     device, torch.float32)
@@ -429,6 +432,7 @@ class LLaMA(nn.Module):
         cfg = dict(DEFAULTS)
         cfg.update(overrides)
         self.cfg = cfg
+        self.grad_ckpt = bool(cfg.get("grad_ckpt", False))
         self.tok_emb = nn.Embedding(cfg["vocab_size"], cfg["dim"])
         self.blocks = nn.ModuleList(Block(cfg) for _ in range(cfg["n_layers"]))
         self.norm = RMSNorm(cfg["dim"], cfg["rms_eps"])
@@ -439,7 +443,7 @@ class LLaMA(nn.Module):
         self.apply(self._init_weights)
 
     def _rope_tables(self, seq, device, dtype):
-        key = (seq, device, dtype)
+        key = (seq, self.cfg["rope_theta"], device, dtype)
         if self._rope_key != key:
             self._rope = rope_cache(seq, self.cfg["head_dim"], self.cfg["rope_theta"],
                                     device, torch.float32)
@@ -453,15 +457,27 @@ class LLaMA(nn.Module):
         if isinstance(m, (nn.Linear, nn.Embedding)):
             nn.init.normal_(m.weight, std=0.02)
 
-    def forward(self, tokens, targets=None, ce_chunk=4096):
-        """tokens: (B, T) int64. Returns (loss,) if targets given, else logits."""
+    def forward(self, tokens, targets=None, ce_chunk=4096, loss_mask=None):
+        """tokens: (B, T) int64. Returns (loss,) if targets given, else logits.
+
+        loss_mask: optional 0/1 tensor parallel to `targets` (already shifted
+        like targets). When given, the loss is the mean CE over masked
+        positions only — the SFT path. Chunked either way, so the full
+        (T, vocab) logits are never materialized at once; the masked path
+        additionally runs every chunk in fp32 for the multiply/sum.
+        """
         bsz, seq = tokens.shape
         x = self.tok_emb(tokens)
         if x.device.type == "cuda":
             x = x.half()  # fp16 residual stream; norms still reduce in fp32
         cos, sin = self._rope_tables(seq, tokens.device, x.dtype)
-        for blk in self.blocks:
-            x = blk(x, cos, sin)
+        if self.grad_ckpt and self.training:
+            import torch.utils.checkpoint as cp
+            for blk in self.blocks:
+                x = cp.checkpoint(blk, x, cos, sin, use_reentrant=False)
+        else:
+            for blk in self.blocks:
+                x = blk(x, cos, sin)
         x = self.norm(x)
         with torch.autocast(device_type=x.device.type, enabled=False):
             if targets is None:
@@ -474,11 +490,19 @@ class LLaMA(nn.Module):
             total = torch.zeros((), device=h.device, dtype=torch.float32)
             flat_h = h.reshape(-1, h.shape[-1])
             flat_t = targets.reshape(-1)
+            if loss_mask is None:
+                for i in range(0, flat_h.shape[0], ce_chunk):
+                    logits = F.linear(flat_h[i:i + ce_chunk], w)
+                    total = total + F.cross_entropy(logits, flat_t[i:i + ce_chunk],
+                                                    reduction="none").float().sum()
+                return total / flat_t.numel()
+            m = loss_mask.reshape(-1).to(torch.float32)
             for i in range(0, flat_h.shape[0], ce_chunk):
                 logits = F.linear(flat_h[i:i + ce_chunk], w)
-                total = total + F.cross_entropy(logits, flat_t[i:i + ce_chunk],
-                                                reduction="none").float().sum()
-            return total / flat_t.numel()
+                ce = F.cross_entropy(logits, flat_t[i:i + ce_chunk],
+                                     reduction="none").float()
+                total = total + (ce * m[i:i + ce_chunk]).sum()
+            return total / m.sum().clamp(min=1.0)
 
     def num_params(self):
         # tied embedding counted once
