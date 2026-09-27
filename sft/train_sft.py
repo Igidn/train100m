@@ -540,19 +540,23 @@ def main():
             print(f"[data] WARNING: {pd.n_oversize} {spec['name']} docs exceed "
                   f"seq {spec['seq']} and are dropped — is SEQ_{spec['name'].upper()} "
                   f"smaller than the bucket?", flush=True)
+        if main_proc:
+            print(f"[data] {spec['name']}: {pd.n_docs} docs / {pd.tokens/1e6:.1f}M tok | "
+                  f"seq {spec['seq']} theta {spec['theta']:.0f} accum {accum} | "
+                  + ", ".join(f"{s['name']}:{s['steps']}st({len(s['rows'])}r)"
+                              for s in segments)
+                  + f" | total {spec['total_steps']} steps ({time.time()-t0:.1f}s)",
+                  flush=True)
         phases.append(spec)
-        print(f"[data] {spec['name']}: {pd.n_docs} docs / {pd.tokens/1e6:.1f}M tok | "
-              f"seq {spec['seq']} theta {spec['theta']:.0f} accum {accum} | "
-              + ", ".join(f"{s['name']}:{s['steps']}st({len(s['rows'])}r)" for s in segments)
-              + f" | total {spec['total_steps']} steps ({time.time()-t0:.1f}s)",
-              flush=True)
     total_steps = sum(p["total_steps"] for p in phases)
     if max_steps:
         total_steps = min(total_steps, max_steps)
     if total_steps <= 0:
         raise SystemExit("no training steps — check PHASES/data")
-    print(f"[plan] {total_steps} optimizer steps, {tokens_per_step/1024:.0f}k tok/step, "
-          f"world {world}, micro {micro_bs}, ce_chunk {ce_chunk}", flush=True)
+    if main_proc:
+        print(f"[plan] {total_steps} optimizer steps, "
+              f"{tokens_per_step/1024:.0f}k tok/step, world {world}, "
+              f"micro {micro_bs}, ce_chunk {ce_chunk}", flush=True)
 
     def locate(g):
         for p in phases:
@@ -573,12 +577,14 @@ def main():
                   grad_ckpt=phases[0]["grad_ckpt"])
     opt = torch.optim.AdamW(param_groups(model, wd=0.1), lr=phases[0]["lr"],
                             betas=(0.9, 0.95), fused=use_cuda)
-    print(f"[model] {model.num_params()/1e6:.1f}M params, vocab {arch['vocab_size']}",
-          flush=True)
+    if main_proc:
+        print(f"[model] {model.num_params()/1e6:.1f}M params, vocab {arch['vocab_size']}",
+              flush=True)
 
     base_path = env["base_ckpt_path"]
     if base_path and os.path.exists(base_path):
-        print(f"[base] local {base_path}", flush=True)
+        if main_proc:
+            print(f"[base] local {base_path}", flush=True)
     else:
         if main_proc:
             from huggingface_hub import hf_hub_download
@@ -593,7 +599,10 @@ def main():
     base = torch.load(base_path, map_location="cpu", weights_only=False)
     model.load_state_dict(base["model"], strict=True)
     del base
-    print(f"[base] weights loaded (strict)", flush=True)
+    accelerator.wait_for_everyone()
+    if main_proc:
+        print("[base] weights loaded (strict)", flush=True)
+        shutil.rmtree(os.path.join(out_dir, "base"), ignore_errors=True)
 
     # ---- resume: local checkpoint first, else HF state.json -> checkpoint-step
     # rank 0 downloads; the file lands in a shared dir every rank can read
@@ -633,6 +642,9 @@ def main():
     else:
         print("[resume] fresh SFT run", flush=True)
     start_step = min(start_step, total_steps)
+    accelerator.wait_for_everyone()
+    if main_proc:
+        shutil.rmtree(os.path.join(out_dir, "hf_resume"), ignore_errors=True)
 
     model, opt = accelerator.prepare(model, opt)
 
