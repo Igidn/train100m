@@ -836,6 +836,10 @@ def main():
         raise
 
     # ---- finalize: full artifacts + HF-format export
+    # done=true only for a full-schedule run: a PHASES/MAX_STEPS-limited run
+    # must stay resumable, otherwise it would block the real run later
+    full_run = (max_steps == 0
+                and {p["name"] for p in phases} == {"bulk", "long", "replay"})
     hf_check = None
     if stop_reason == "completed":
         ph = phases[-1]
@@ -872,7 +876,7 @@ def main():
         print(f"[done] {stop_reason} at step {step}/{total_steps}", flush=True)
         publish_state(step, cur_phase["name"] if cur_phase else "", 0.0, tokens_seen,
                       val_hist.get(cur_phase["name"]) if cur_phase else None,
-                      done=(stop_reason == "completed"))
+                      done=(stop_reason == "completed" and full_run))
         if uploader:
             uploader.drain()
         if wandb:
