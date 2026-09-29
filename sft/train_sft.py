@@ -38,8 +38,11 @@ the kernel again:
   SFT/{tokenizer.json,tokenizer_config.json,generation_config.json,README.md}
 
 A 1.4GB checkpoint upload runs on a background thread so the GPUs never wait
-on the Hub; state.json is written only after its checkpoint lands, so it
-always points at a file that exists.
+on the Hub; uploads retry a few times before they are dropped. state.json is
+only published for steps whose checkpoint was written — a MAX_HOURS stop
+between checkpoint intervals keeps the previous step — and resume falls back
+to the newest checkpoint actually on the Hub when the exact one is missing,
+so a wall stop never becomes a restart from scratch.
 
 Env:
   SFT_DATA_DIR      sft-tok-v1 root (required; short/ mid/ long/ manifest.json)
@@ -195,8 +198,9 @@ class HFUploader(threading.Thread):
 
     Items: ("ckpt", path, step) uploads SFT/checkpoint-<step>.pt; the
     ("state", dict) queued after it records that step; ("clean", step) then
-    prunes numbered checkpoints beyond the newest `keep`. Exceptions are
-    printed and swallowed — the Hub must never kill a run.
+    prunes numbered checkpoints beyond the newest `keep`. Transient failures
+    are retried; anything still failing is printed and swallowed — the Hub
+    must never kill a run.
     """
 
     def __init__(self, repo, token, folder, keep=2):
@@ -209,6 +213,18 @@ class HFUploader(threading.Thread):
     def submit(self, item):
         self.q.put(item)
 
+    def _upload(self, api, **kwargs):
+        """api.upload_file with a few retries; raises after the last attempt."""
+        for attempt in range(3):
+            try:
+                api.upload_file(**kwargs)
+                return
+            except Exception as e:
+                if attempt == 2:
+                    raise
+                print(f"[hf] upload failed ({e}); retrying", flush=True)
+                time.sleep(5 * (attempt + 1))
+
     def run(self):
         from huggingface_hub import HfApi
         api = HfApi(token=self.token)
@@ -220,21 +236,21 @@ class HFUploader(threading.Thread):
                 kind = item[0]
                 if kind == "ckpt":
                     _, path, step = item
-                    api.upload_file(path_or_fileobj=path,
-                                    path_in_repo=f"{self.folder}/checkpoint-{step}.pt",
-                                    repo_id=self.repo, repo_type="model")
+                    self._upload(api, path_or_fileobj=path,
+                                 path_in_repo=f"{self.folder}/checkpoint-{step}.pt",
+                                 repo_id=self.repo, repo_type="model")
                     self.last_step = step
                     print(f"[hf] uploaded checkpoint-{step}.pt", flush=True)
                 elif kind == "state":
-                    api.upload_file(
-                        path_or_fileobj=io.BytesIO(json.dumps(item[1], indent=1).encode()),
-                        path_in_repo=f"{self.folder}/state.json",
-                        repo_id=self.repo, repo_type="model")
+                    self._upload(api,
+                                 path_or_fileobj=io.BytesIO(json.dumps(item[1], indent=1).encode()),
+                                 path_in_repo=f"{self.folder}/state.json",
+                                 repo_id=self.repo, repo_type="model")
                 elif kind == "file":
                     _, path, name = item
-                    api.upload_file(path_or_fileobj=path,
-                                    path_in_repo=f"{self.folder}/{name}",
-                                    repo_id=self.repo, repo_type="model")
+                    self._upload(api, path_or_fileobj=path,
+                                 path_in_repo=f"{self.folder}/{name}",
+                                 repo_id=self.repo, repo_type="model")
                     print(f"[hf] uploaded {name}", flush=True)
                 elif kind == "clean":
                     _, step = item
@@ -273,20 +289,83 @@ def fetch_remote_state(env, out_dir):
         return None
 
 
+def remote_ckpt_steps(env):
+    """Steps with SFT/checkpoint-<step>.pt on the Hub, ascending ([] on failure)."""
+    if not env["hf_repo"] or not env["hf_token"]:
+        return []
+    try:
+        from huggingface_hub import HfApi
+        names = HfApi(token=env["hf_token"]).list_repo_files(
+            repo_id=env["hf_repo"], repo_type="model")
+    except Exception as e:
+        print(f"[hf] checkpoint listing failed: {e}", flush=True)
+        return []
+    prefix = f"{env['hf_dir']}/checkpoint-"
+    steps = []
+    for n in names:
+        if n.startswith(prefix) and n.endswith(".pt"):
+            tail = n[len(prefix):-len(".pt")]
+            if tail.isdigit():
+                steps.append(int(tail))
+    return sorted(set(steps))
+
+
 def fetch_resume_ckpt(env, out_dir, step, accelerator):
-    """Download SFT/checkpoint-<step>.pt on rank 0, return the local path."""
+    """Fetch the best resume checkpoint from the Hub.
+
+    Exact SFT/checkpoint-<step>.pt is preferred. A MAX_HOURS stop lands
+    between checkpoint intervals, so state.json can name a step that was never
+    saved; fall back to the newest checkpoint at or before that step (newest
+    overall if every checkpoint is newer). Rank 0 downloads and writes its pick
+    to a sidecar file so every rank resolves the same step. Returns the local
+    path, or None if nothing could be fetched.
+    """
+    pick_path = os.path.join(out_dir, "hf_resume", "resume_step.txt")
     if accelerator.is_main_process:
-        try:
-            from huggingface_hub import hf_hub_download
-            hf_hub_download(repo_id=env["hf_repo"],
-                            filename=f"{env['hf_dir']}/checkpoint-{step}.pt",
-                            token=env["hf_token"],
-                            local_dir=os.path.join(out_dir, "hf_resume"))
-        except Exception as e:
-            print(f"[hf] resume checkpoint fetch failed: {e}", flush=True)
+        os.makedirs(os.path.dirname(pick_path), exist_ok=True)
+        if os.path.exists(pick_path):
+            os.remove(pick_path)  # never let a stale pick masquerade as this one
+        steps = remote_ckpt_steps(env)
+        pick = None
+        if step in steps:
+            pick = step
+        elif steps:
+            earlier = [s for s in steps if s < step]
+            pick = earlier[-1] if earlier else steps[-1]
+            print(f"[hf] checkpoint-{step}.pt is not on the Hub; resuming from "
+                  f"the newest saved checkpoint, checkpoint-{pick}.pt", flush=True)
+        if pick is None:
+            print(f"[hf] no checkpoint found for step {step}", flush=True)
+        else:
+            local = os.path.join(out_dir, env["hf_dir"], f"checkpoint-{pick}.pt")
+            try:
+                if os.path.exists(local):
+                    print(f"[hf] checkpoint-{pick}.pt already local; "
+                          f"skipping download", flush=True)
+                else:
+                    from huggingface_hub import hf_hub_download
+                    hf_hub_download(repo_id=env["hf_repo"],
+                                    filename=f"{env['hf_dir']}/checkpoint-{pick}.pt",
+                                    token=env["hf_token"],
+                                    local_dir=os.path.join(out_dir, "hf_resume"))
+                    print(f"[hf] downloaded checkpoint-{pick}.pt", flush=True)
+                with open(pick_path, "w") as f:
+                    f.write(str(pick))
+            except Exception as e:
+                print(f"[hf] checkpoint-{pick}.pt fetch failed: {e}", flush=True)
     accelerator.wait_for_everyone()
-    path = os.path.join(out_dir, "hf_resume", env["hf_dir"], f"checkpoint-{step}.pt")
-    return path if os.path.exists(path) else None
+    if not os.path.exists(pick_path):
+        return None
+    try:
+        with open(pick_path) as f:
+            pick = int(f.read().strip())
+    except ValueError:
+        return None
+    for base in (os.path.join(out_dir, "hf_resume"), out_dir):
+        path = os.path.join(base, env["hf_dir"], f"checkpoint-{pick}.pt")
+        if os.path.exists(path):
+            return path
+    return None
 
 
 # ---------------------------------------------------------------- export
@@ -628,6 +707,12 @@ def main():
     ck_path = local_files[-1] if local_step >= start_step and local_files else None
     if ck_path is None and start_step > 0 and env["hf_repo"] and env["hf_token"]:
         ck_path = fetch_resume_ckpt(env, out_dir, start_step, accelerator)
+    if ck_path is None and local_files:
+        # Hub unreachable (or nothing uploaded yet): a local checkpoint behind
+        # state.json still beats a restart from scratch
+        ck_path = local_files[-1]
+        print(f"[resume] Hub fetch unsuccessful; falling back to local "
+              f"{os.path.basename(ck_path)} (state step {start_step})", flush=True)
     if ck_path is None and start_step > 0:
         raise SystemExit(f"state.json says step {start_step} but no checkpoint "
                          f"could be fetched; refusing to restart from scratch")
@@ -641,6 +726,10 @@ def main():
         print(f"[resume] {ck_path} -> step {start_step}/{total_steps}", flush=True)
     else:
         print("[resume] fresh SFT run", flush=True)
+    # newest checkpoint behind the resume point; state.json must never be
+    # published past it (a MAX_HOURS stop lands between checkpoint intervals)
+    last_state = dict(step=start_step, phase_name="", lr=0.0, tokens=tokens_seen,
+                      val=None)
     start_step = min(start_step, total_steps)
     accelerator.wait_for_everyone()
     if main_proc:
@@ -661,10 +750,13 @@ def main():
                 updated=time.strftime("%Y-%m-%d %H:%M:%S"))))
 
     def checkpoint(step, phase_name, lr, tokens, val):
+        nonlocal last_state
         path = os.path.join(sft_out, f"checkpoint-{step}.pt")
         save_ckpt(path, accelerator, model, opt,
                   dict(step=step, phase=phase_name, tokens_seen=tokens,
                        val_hist=val_hist, lr=lr))
+        last_state = dict(step=step, phase_name=phase_name, lr=lr, tokens=tokens,
+                          val=val)
         if uploader:
             uploader.submit(("ckpt", path, step))
             uploader.submit(("clean", step))
@@ -680,6 +772,8 @@ def main():
                     os.remove(p)
 
     ph_start, _ = locate(start_step)
+    last_state["phase_name"] = ph_start["name"] if ph_start else ""
+    last_state["val"] = val_hist.get(last_state["phase_name"])
     publish_state(start_step, ph_start["name"] if ph_start else "", 0.0, tokens_seen,
                   val_hist.get(ph_start["name"]) if ph_start else None)
     accelerator.wait_for_everyone()
@@ -874,9 +968,9 @@ def main():
         accelerator.wait_for_everyone()
     if main_proc:
         print(f"[done] {stop_reason} at step {step}/{total_steps}", flush=True)
-        publish_state(step, cur_phase["name"] if cur_phase else "", 0.0, tokens_seen,
-                      val_hist.get(cur_phase["name"]) if cur_phase else None,
-                      done=(stop_reason == "completed" and full_run))
+        # publish the last *checkpointed* step, not the step the wall stopped
+        # at: state.json must keep naming a checkpoint that exists
+        publish_state(**last_state, done=(stop_reason == "completed" and full_run))
         if uploader:
             uploader.drain()
         if wandb:
