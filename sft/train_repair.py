@@ -895,7 +895,7 @@ def main():
                                  f"steps ending at {step}")
             step_loss = accelerator.gather(loss_t).mean().item() / accum
 
-            if step % 50 == 0 or step <= start_step + 5 or step == total_steps or n_bad:
+            if step % 5 == 0 or step <= start_step + 5 or step == total_steps or n_bad:
                 if main_proc:
                     tps = tokens_win / max(1e-9, time.time() - t_win)
                     msg = (f"[{step}/{total_steps}] {ph['name']} {seg['name']} "
