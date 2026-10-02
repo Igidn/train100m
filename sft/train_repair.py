@@ -14,7 +14,7 @@ Default schedule (single phase; every knob is env-tunable):
            30-step warmup and cosine decay to floor 0.1, grad ckpt auto
   long     seq 32768, theta 500k, long bucket, 1 epoch, LR 1e-5 — opt-in via
            PHASES=repair,long, only worth it if 32k tool use is a target (the
-           long bucket holds just 186 docs / 2.5M tokens)
+           long bucket holds just 183 train docs / 2.5M tokens)
 
 The repair mix carries its own anti-regression replay (3,500 general instruct
 rows, ~5% of rows / ~11% of tokens), so REPLAY_FRAC defaults to 0.0. The
