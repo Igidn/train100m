@@ -497,16 +497,23 @@ def verify_hf_export(export_dir, model, device, n=64):
         return None
 
 
-def write_readme(path, arch, phases, step, tokens_seen, val_hist, final):
+def write_readme(path, arch, phases, step, tokens_seen, val_hist, final,
+                 data_name="", base_ckpt="", data_desc=""):
+    """Write the export card.
+
+    data_name / base_ckpt / data_desc describe the run that actually happened.
+    They used to be hardcoded ("repair-tok-v1", "SFT/final.pt"), which
+    mislabelled every later pass — REPAIR2/ was a run on multi-tok-v1 from
+    REPAIR/final.pt but shipped a card claiming repair-tok-v1 from SFT.
+    """
     with open(path, "w") as f:
         f.write(
-            "# TinyBalls-V1 — tool-call repair (repair-tok-v1)\n\n"
+            f"# TinyBalls-V1 — tool-call repair ({data_name})\n\n"
             f"113M-param LLaMA (`{arch['dim']}`d, {arch['n_layers']}L, "
             f"{arch['n_heads']}/{arch['n_kv_heads']}-head GQA, vocab "
-            f"{arch['vocab_size']}), repaired from the SFT checkpoint "
-            f"`igidn/tinyballs-v1` `SFT/final.pt` on the targeted tool-use mix "
-            f"`repair-tok-v1` (schema binding, abstention, error recovery, "
-            f"grounded answers).\n\n"
+            f"{arch['vocab_size']}), continued from "
+            f"`{base_ckpt}` on the targeted tool-use mix "
+            f"`{data_name}`{data_desc}.\n\n"
             f"- phases: " + ", ".join(p["name"] for p in phases) + "\n"
             f"- steps: {step}, tokens: {tokens_seen/1e6:.1f}M\n"
             f"- val loss: {json.dumps(val_hist)}\n"
@@ -515,10 +522,21 @@ def write_readme(path, arch, phases, step, tokens_seen, val_hist, final):
             "```\n"
             "<|im_start|>system\n{system}<|im_end|>\n"
             "<|im_start|>user\n{user}<|im_end|>\n"
-            "<|im_start|>assistant\n[{reasoning}] {content}<|im_end|>\n"
+            "<|im_start|>assistant\n"
+            "[<think>{reasoning}</think> ]{content}"
+            "<|tool_call|>{\"name\": ..., \"arguments\": {...}}]\n"
+            "<|im_end|>\n"
+            "<|im_start|>tool\n<|tool_result|>{result}<|im_end|>\n"
             "```\n\n"
-            "Generation stops at `<|im_end|>` (id 2); eos (id 0) is the packing "
-            "separator. Reasoning is plain text wrapped in `<think>...</think>`.\n\n"
+            "Generation stops at `<|im_end|>` (id 2); eos (id 0) is the "
+            "packing separator. `<|im_start|>`, `<|im_end|>`, "
+            "`<|tool_call|>` and `<|tool_result|>` are added tokens "
+            "(ids 1, 2, 49152, 49153), not multi-token text \u2014 encode the prompt \n"
+            "with the shipped `tokenizer.json`, not by string splitting. "
+            "An assistant turn is optional `<think>...</think>` "
+            "reasoning (plain text, no new tokens), then content, then "
+            "zero or more `<|tool_call|>` segments, then "
+            f"`<|im_end|>`.\n\n"
             "## Files\n\n"
             "- `model.safetensors` / `config.json`: `transformers` "
             "`LlamaForCausalLM` (tied embeddings). Load with "
@@ -968,8 +986,21 @@ def main():
                       export_dir, os.path.join(data_dir, "tokenizer.json"))
             hf_check = verify_hf_export(export_dir, accelerator.unwrap_model(model),
                                         "cuda" if use_cuda else "cpu")
+            manifest = {}
+            mpath = os.path.join(data_dir, "manifest.json")
+            if os.path.exists(mpath):
+                try:
+                    with open(mpath) as mf:
+                        manifest = json.load(mf)
+                except Exception:
+                    manifest = {}
+            data_name = (manifest.get("name")
+                         or os.path.basename(os.path.normpath(data_dir)))
             write_readme(os.path.join(export_dir, "README.md"), arch, phases,
-                         step, tokens_seen, val_hist, final)
+                         step, tokens_seen, val_hist, final,
+                         data_name=data_name,
+                         base_ckpt=f"{env['base_repo']}/{env['base_ckpt_file']}",
+                         data_desc=os.environ.get("DATA_DESC", ""))
             if uploader:
                 uploader.submit(("file", path, "final.pt"))
                 for f in sorted(os.listdir(export_dir)):
