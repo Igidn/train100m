@@ -96,7 +96,7 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
-    def forward(self, x, cos, sin):
+    def forward(self, x, cos, sin, cache=None):
         global _SDPA_PROBED
         bsz, seq, _ = x.shape
         q = self.q_proj(x).view(bsz, seq, self.n_heads, self.head_dim).transpose(1, 2)
@@ -106,6 +106,11 @@ class Attention(nn.Module):
         # stay fp16 and the fused memory-efficient kernel stays usable on sm75
         q = q * cos + rotate_half(q) * sin
         k = k * cos + rotate_half(k) * sin
+        if cache is not None:
+            # Cache the *unexpanded* kv (n_kv_heads), not the repeat_interleave
+            # copy: 3x less cache memory, and the expansion is redone per step
+            # from the same source. cache.append returns the full history.
+            k, v = cache.append(self, k, v)
         # expand kv heads manually: enable_gqa pushes sm75 SDPA onto the math
         # backend, which materializes and retains the full fp32 attention matrix
         n_rep = self.n_heads // self.n_kv_heads
@@ -117,7 +122,13 @@ class Attention(nn.Module):
             print(f"[attn probe] q/k/v dtype {q.dtype}, "
                   f"uniform={q.dtype == k.dtype == v.dtype}, head_dim {self.head_dim}",
                   flush=True)
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        # A cached step has seq == 1: the single query is the newest position and
+        # every cached key is causally <= it, so no mask is needed. is_causal=True
+        # would be *wrong* there — PyTorch aligns it top-left, so with q_len=1 it
+        # would mask every key except position 0. Gate on `cache`, not on seq:
+        # a 1-token sequence with no cache is still a normal causal forward.
+        mask = not (cache is not None and seq == 1)
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=mask)
         out = out.transpose(1, 2).reshape(bsz, seq, -1)
         return self.o_proj(out)
 
@@ -148,8 +159,8 @@ class Block(nn.Module):
         self.mlp_norm = RMSNorm(cfg["dim"], cfg["rms_eps"])
         self.mlp = MLP(cfg["dim"], cfg["ffn_dim"])
 
-    def forward(self, x, cos, sin):
-        x = x + self.attn(self.attn_norm(x), cos, sin)
+    def forward(self, x, cos, sin, cache=None):
+        x = x + self.attn(self.attn_norm(x), cos, sin, cache)
         x = x + self.mlp(self.mlp_norm(x))
         return x
 
@@ -457,7 +468,8 @@ class LLaMA(nn.Module):
         if isinstance(m, (nn.Linear, nn.Embedding)):
             nn.init.normal_(m.weight, std=0.02)
 
-    def forward(self, tokens, targets=None, ce_chunk=4096, loss_mask=None):
+    def forward(self, tokens, targets=None, ce_chunk=4096, loss_mask=None,
+                cache=None, pos_offset=0):
         """tokens: (B, T) int64. Returns (loss,) if targets given, else logits.
 
         loss_mask: optional 0/1 tensor parallel to `targets` (already shifted
@@ -465,19 +477,35 @@ class LLaMA(nn.Module):
         positions only — the SFT path. Chunked either way, so the full
         (T, vocab) logits are never materialized at once; the masked path
         additionally runs every chunk in fp32 for the multiply/sum.
+
+        cache / pos_offset: incremental decoding for RL rollouts. `cache` is a
+        LayerViews (see llama/kv_cache.py) or None; `pos_offset` is the absolute
+        position of tokens[:, 0], so a cached decode step gets the right rope
+        phase instead of restarting from 0. Both default to the previous
+        behaviour, so training and the battery are unaffected.
         """
         bsz, seq = tokens.shape
         x = self.tok_emb(tokens)
         if x.device.type == "cuda":
             x = x.half()  # fp16 residual stream; norms still reduce in fp32
-        cos, sin = self._rope_tables(seq, tokens.device, x.dtype)
+        if cache is None:
+            cos, sin = self._rope_tables(seq, tokens.device, x.dtype)
+        else:
+            cos, sin = self._rope_tables(pos_offset + seq, tokens.device, x.dtype)
+            cos = cos[:, :, pos_offset:pos_offset + seq, :]
+            sin = sin[:, :, pos_offset:pos_offset + seq, :]
         if self.grad_ckpt and self.training:
             import torch.utils.checkpoint as cp
             for blk in self.blocks:
                 x = cp.checkpoint(blk, x, cos, sin, use_reentrant=False)
         else:
-            for blk in self.blocks:
-                x = blk(x, cos, sin)
+            for i, blk in enumerate(self.blocks):
+                # cache is a LayerViews; each block needs its own view so it can
+                # write to (and read back) its layer's slice
+                x = blk(x, cos, sin, cache[i] if cache is not None else None)
+            # advance once per forward, not once per layer — see KVCache.append
+            if cache is not None:
+                cache.cache.advance(seq)
         x = self.norm(x)
         with torch.autocast(device_type=x.device.type, enabled=False):
             if targets is None:
