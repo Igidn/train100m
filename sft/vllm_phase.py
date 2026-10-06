@@ -155,7 +155,12 @@ def try_spec(spec, report):
 def engine_checks(report):
     """Load the model, generate, and compare against our own decode."""
     from transformers import AutoTokenizer
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    # sft/ for rollout + reward, and the repo root for the `llama` package — the
+    # comparison step needs our own implementation, which lives one level up.
+    here = os.path.dirname(os.path.abspath(__file__))
+    for p in (here, os.path.dirname(here)):
+        if p not in sys.path:
+            sys.path.insert(0, p)
     from rollout import (IM_END, TOOL_CALL, VLLMEngine, build_model_from_hf,
                          render_prefix)
     from reward import compare_weather_task
