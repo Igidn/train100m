@@ -42,34 +42,44 @@ def pip(*args):
     return subprocess.run([sys.executable, "-m", "pip", "install", "-q", *args])
 
 
-def torch_pin():
-    """The torch version the installed vllm wheel wants.
+def pins_for(packages=("torch", "torchaudio", "torchvision")):
+    """Versions the installed vllm wheel pins, read from its own metadata.
 
-    Read from the wheel's own metadata rather than from `vllm.__version__`, so it
-    is available before the (possibly broken) import.
+    All of them have to move together. vLLM starts by refusing to run when
+    PyTorch and TorchAudio disagree about CUDA
+    ("Detected that PyTorch and TorchAudio were compiled with different CUDA
+    versions"), and the image ships torchaudio against a different CUDA than the
+    torch the wheel wants — so installing torch alone moves the mismatch rather
+    than fixing it.
     """
     import importlib.metadata as md
     try:
         reqs = list(md.requires("vllm") or [])
     except Exception as e:
         say(f"[vllm] metadata unavailable: {e}")
-        return None
+        return {}
+    pins = {}
     for r in reqs:
-        m = re.match(r"\s*torch\s*\(?==\s*([0-9][^,);\s]*)", r)
-        if m:
-            return m.group(1)
+        for pkg in packages:
+            m = re.match(rf"\s*{pkg}\s*\(?==\s*([0-9][^,);\s]*)", r)
+            if m:
+                pins[pkg] = m.group(1)
+    if pins:
+        return pins
+    # fall back to `pip show`, whose Requires lines are comma-joined
     try:
         out = subprocess.run([sys.executable, "-m", "pip", "show", "vllm"],
                              capture_output=True, text=True).stdout
         for line in out.splitlines():
             if line.startswith("Requires:"):
                 for part in line.split(":", 1)[1].split(","):
-                    m = re.match(r"\s*torch\s*\(?==\s*([0-9][^,);\s]*)", part)
-                    if m:
-                        return m.group(1)
+                    for pkg in packages:
+                        m = re.match(rf"\s*{pkg}\s*\(?==\s*([0-9][^,);\s]*)", part)
+                        if m:
+                            pins[pkg] = m.group(1)
     except Exception as e:
         say(f"[vllm] pip show failed: {e}")
-    return None
+    return pins
 
 
 def try_spec(spec, report):
@@ -80,19 +90,26 @@ def try_spec(spec, report):
     except subprocess.CalledProcessError as e:
         rec["error"] = f"pip install failed: {e}"
         return rec
-    pin = torch_pin()
-    rec["torch_pin"] = pin
-    if pin:
-        import torch
-        have = torch.__version__.split("+")[0]
-        if have != pin:
-            say(f"[vllm] wheel wants torch {pin}, this process has {have}; "
-                f"installing torch=={pin} from {CU_INDEX}")
-            try:
-                pip("--index-url", CU_INDEX, f"torch=={pin}")
-            except subprocess.CalledProcessError as e:
-                rec["error"] = f"torch {pin} install failed: {e}"
-                return rec
+    pins = pins_for()
+    rec["pins"] = pins
+    want = []
+    for pkg, ver in pins.items():
+        try:
+            import importlib.metadata as md
+            have = (md.version(pkg) or "").split("+")[0]
+        except Exception:
+            have = ""
+        if have != ver:
+            want.append(f"{pkg}=={ver}")
+    if want:
+        say(f"[vllm] wheel pins {pins}; installing {' '.join(want)} from {CU_INDEX}")
+        try:
+            pip("--index-url", CU_INDEX, *want)
+        except subprocess.CalledProcessError as e:
+            rec["error"] = f"installing {' '.join(want)} failed: {e}"
+            return rec
+    else:
+        say(f"[vllm] installed stack already matches {pins}")
     try:
         import torch
         import vllm
