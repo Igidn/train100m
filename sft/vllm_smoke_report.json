@@ -1,0 +1,285 @@
+{
+ "model": "igidn/TinyBalls-110M-V1",
+ "checks": {
+  "tok.vocab_size": {
+   "ok": true,
+   "detail": "49152 (base BPE size; len(tok) is the real check)",
+   "soft": false
+  },
+  "tok.vocab_len": {
+   "ok": true,
+   "detail": "49154",
+   "soft": false
+  },
+  "tok.single.im_start": {
+   "ok": true,
+   "detail": "want [1], got [1]",
+   "soft": false
+  },
+  "tok.decode.im_start": {
+   "ok": true,
+   "detail": "decode([1]) -> '<|im_start|>'",
+   "soft": true
+  },
+  "tok.single.im_end": {
+   "ok": true,
+   "detail": "want [2], got [2]",
+   "soft": false
+  },
+  "tok.decode.im_end": {
+   "ok": true,
+   "detail": "decode([2]) -> '<|im_end|>'",
+   "soft": true
+  },
+  "tok.single.tool_call": {
+   "ok": true,
+   "detail": "want [49152], got [49152]",
+   "soft": false
+  },
+  "tok.decode.tool_call": {
+   "ok": true,
+   "detail": "decode([49152]) -> '<|tool_call|>'",
+   "soft": true
+  },
+  "tok.single.tool_result": {
+   "ok": true,
+   "detail": "want [49153], got [49153]",
+   "soft": false
+  },
+  "tok.decode.tool_result": {
+   "ok": true,
+   "detail": "decode([49153]) -> '<|tool_result|>'",
+   "soft": true
+  },
+  "tok.prompt.has_im_start": {
+   "ok": true,
+   "detail": "im_start x3",
+   "soft": false
+  },
+  "tok.prompt.has_im_end": {
+   "ok": true,
+   "detail": "im_end x2",
+   "soft": false
+  },
+  "tok.vllm_matches_hf": {
+   "ok": true,
+   "detail": "deferred: ModuleNotFoundError",
+   "soft": true
+  },
+  "fidelity.no_missing_weights": {
+   "ok": true,
+   "detail": "0 missing",
+   "soft": false
+  },
+  "fidelity.argmax_agreement": {
+   "ok": true,
+   "detail": "0.9842 over 253 positions, max|top1 gap| 0.1893",
+   "soft": false
+  },
+  "fidelity.logit_scale": {
+   "ok": true,
+   "detail": "max 0.3929 mean 0.02543",
+   "soft": false
+  },
+  "vllm.engine_works": {
+   "ok": true,
+   "detail": "rc=0; [{'spec': 'vllm', 'pins': {'torch': '2.13.0', 'torchaudio': '2.11.0', 'torchvision': '0.28.0'}, 'torch': '2.13.0+cu130', 'vllm': '0.31.0', 'device': 'Tesla T4', 'capability': 'DeviceCapability(major=7",
+   "soft": false
+  },
+  "fallback.kv_ran": {
+   "ok": true,
+   "detail": "64 tokens",
+   "soft": false
+  },
+  "throughput.sane_kv": {
+   "ok": true,
+   "detail": "74.0 tok/s at batch 8",
+   "soft": false
+  }
+ },
+ "ok": true,
+ "gpu": {
+  "torch": "2.11.0+cu128",
+  "n": 2,
+  "names": [
+   "Tesla T4",
+   "Tesla T4"
+  ],
+  "capability": "(7, 5)"
+ },
+ "repo_sha": "a04c0ae",
+ "prompt_tokens": 253,
+ "teacher_forced": {
+  "clamp_only": {
+   "max_abs_dlogit": 0.39288556575775146,
+   "mean_abs_dlogit": 0.02542649768292904,
+   "argmax_agreement": 0.9841897487640381,
+   "max_top1_gap": 0.18934249877929688
+  },
+  "cuda_fp16_autocast": {
+   "max_abs_dlogit": 0.4042319059371948,
+   "argmax_agreement": 0.9881423115730286
+  }
+ },
+ "vllm_phase": {
+  "ok": true,
+  "attempts": [
+   {
+    "spec": "vllm",
+    "pins": {
+     "torch": "2.13.0",
+     "torchaudio": "2.11.0",
+     "torchvision": "0.28.0"
+    },
+    "torch": "2.13.0+cu130",
+    "vllm": "0.31.0",
+    "device": "Tesla T4",
+    "capability": "DeviceCapability(major=7, minor=5)"
+   }
+  ],
+  "tok.vllm_markers": {
+   "ok": true,
+   "detail": "[49152]"
+  },
+  "throughput": {
+   "batch": 8,
+   "tokens": 152,
+   "seconds": 8.350305795669556,
+   "tok_per_s": 18.202926182514986
+  },
+  "gen_fidelity": {
+   "common_prefix": 25,
+   "vllm": [
+    49152,
+    39428,
+    1245,
+    1799,
+    476,
+    726,
+    79,
+    29624,
+    79,
+    612,
+    1002,
+    476,
+    24370,
+    1799,
+    24635,
+    35769,
+    20721,
+    76,
+    1799,
+    34101,
+    2068,
+    17405,
+    35769,
+    18206,
+    109,
+    2
+   ],
+   "ours": [
+    49152,
+    39428,
+    1245,
+    1799,
+    476,
+    726,
+    79,
+    29624,
+    79,
+    612,
+    1002,
+    476,
+    24370,
+    1799,
+    24635,
+    35769,
+    20721,
+    76,
+    1799,
+    34101,
+    2068,
+    17405,
+    35769,
+    18206,
+    109
+   ]
+  }
+ },
+ "fallback_kv": {
+  "ids": [
+   49152,
+   39428,
+   1245,
+   1799,
+   476,
+   726,
+   79,
+   29624,
+   1002,
+   476,
+   24370,
+   1799,
+   24635,
+   35769,
+   20721,
+   76,
+   1799,
+   34101,
+   2068,
+   17405,
+   35769,
+   18206,
+   109,
+   49152,
+   39428,
+   1245,
+   1799,
+   476,
+   726,
+   79,
+   29624,
+   1002,
+   476,
+   24370,
+   1799,
+   24635,
+   35769,
+   20721,
+   76,
+   1799,
+   34101,
+   5529,
+   2863,
+   35769,
+   18206,
+   109,
+   49152,
+   39428,
+   1245,
+   1799,
+   476,
+   726,
+   79,
+   29624,
+   1002,
+   476,
+   24370,
+   1799,
+   24635,
+   35769,
+   20721,
+   76,
+   1799,
+   34101
+  ],
+  "finish": "length"
+ },
+ "throughput_kv": {
+  "batch": 8,
+  "new_tokens": 368,
+  "seconds": 4.975538492202759,
+  "tok_per_s": 73.96184364299428
+ },
+ "note": "Kaggle kernel katherinameyerkat/tinyballs-vllm-smoke v14, 2x Tesla T4 (sm75), torch 2.13.0+cu130, vllm 0.31.0. See sft/vllm_phase.py for the engine half and .kaggle/vllm-smoke/kernel.py for the engine-independent checks. Kept as the record for RL_TRAINING.md 6."
+}
