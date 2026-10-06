@@ -83,33 +83,11 @@ def pins_for(packages=("torch", "torchaudio", "torchvision")):
 
 
 def import_vllm():
-    """Import vLLM and its compiled CUDA path, healing the one guard we keep hitting.
-
-    vLLM 0.31 pins torch 2.13.0 but torchaudio 2.11.0 and torchvision 0.28.0, and
-    it refuses to start when PyTorch and TorchAudio disagree about CUDA:
-
-        Detected that PyTorch and TorchAudio were compiled with different CUDA
-        versions. PyTorch has CUDA version 13.0 whereas TorchAudio has CUDA
-        version 12.8.
-
-    Matching versions is not available — the wheel's own pins are inconsistent —
-    so for a text-only run the fix is to remove the audio stack, which vLLM does
-    not need here. One retry after uninstalling; anything else is a real error.
-    """
-    try:
-        import vllm
-        from vllm.platforms import current_platform
-        return vllm, current_platform
-    except Exception as e:
-        if "TorchAudio" not in str(e) and "torchaudio" not in str(e).lower():
-            raise
-        say(f"[vllm] CUDA guard tripped ({str(e)[:120]}); removing the audio stack")
-        for pkg in ("torchaudio", "torchvision"):
-            subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "-q",
-                            pkg], check=False)
-        import vllm
-        from vllm.platforms import current_platform
-        return vllm, current_platform
+    """Import vLLM and its compiled CUDA path (vllm.platforms is where the _C
+    extension actually loads)."""
+    import vllm
+    from vllm.platforms import current_platform
+    return vllm, current_platform
 
 
 def try_spec(spec, report):
@@ -140,6 +118,18 @@ def try_spec(spec, report):
             return rec
     else:
         say(f"[vllm] installed stack already matches {pins}")
+
+    # Proactive, not reactive: the guard is `_check_cuda_version` inside
+    # vllm/entrypoints/llm.py, so it fires when `LLM(...)` is constructed rather
+    # than at import, and a retry around the import never sees it. vLLM 0.31's own
+    # pins are internally inconsistent (torch 2.13.0, torchaudio 2.11.0), so no
+    # version pair can agree; what disagrees is the CUDA *build*. This is a
+    # text-only run, so the audio stack goes.
+    say("[vllm] removing torchaudio/torchvision (text-only; dodges the "
+        "torch/torchaudio CUDA guard)")
+    for pkg in ("torchaudio", "torchvision"):
+        subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "-q", pkg],
+                       check=False)
     try:
         import torch
         vllm, current_platform = import_vllm()
