@@ -82,6 +82,36 @@ def pins_for(packages=("torch", "torchaudio", "torchvision")):
     return pins
 
 
+def import_vllm():
+    """Import vLLM and its compiled CUDA path, healing the one guard we keep hitting.
+
+    vLLM 0.31 pins torch 2.13.0 but torchaudio 2.11.0 and torchvision 0.28.0, and
+    it refuses to start when PyTorch and TorchAudio disagree about CUDA:
+
+        Detected that PyTorch and TorchAudio were compiled with different CUDA
+        versions. PyTorch has CUDA version 13.0 whereas TorchAudio has CUDA
+        version 12.8.
+
+    Matching versions is not available — the wheel's own pins are inconsistent —
+    so for a text-only run the fix is to remove the audio stack, which vLLM does
+    not need here. One retry after uninstalling; anything else is a real error.
+    """
+    try:
+        import vllm
+        from vllm.platforms import current_platform
+        return vllm, current_platform
+    except Exception as e:
+        if "TorchAudio" not in str(e) and "torchaudio" not in str(e).lower():
+            raise
+        say(f"[vllm] CUDA guard tripped ({str(e)[:120]}); removing the audio stack")
+        for pkg in ("torchaudio", "torchvision"):
+            subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "-q",
+                            pkg], check=False)
+        import vllm
+        from vllm.platforms import current_platform
+        return vllm, current_platform
+
+
 def try_spec(spec, report):
     """Install one candidate (plus its torch) and see whether it runs here."""
     rec = {"spec": spec}
@@ -112,8 +142,7 @@ def try_spec(spec, report):
         say(f"[vllm] installed stack already matches {pins}")
     try:
         import torch
-        import vllm
-        from vllm.platforms import current_platform
+        vllm, current_platform = import_vllm()
         cap = current_platform.get_device_capability()
         dev = current_platform.get_device_name()
     except Exception as e:
