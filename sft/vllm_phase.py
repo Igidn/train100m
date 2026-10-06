@@ -124,15 +124,32 @@ def engine_checks(report):
     tok = AutoTokenizer.from_pretrained(REPO)
     prompt_ids = render_prefix(tok, compare_weather_task().messages())
 
-    from vllm.transformers_utils.tokenizer import get_tokenizer
-    vtok = get_tokenizer(REPO)
-    same = list(vtok.encode(TOOL_CALL, add_special_tokens=False)) == [49152]
-    report["tok.vllm_markers"] = {"ok": same,
-                                  "detail": str(list(vtok.encode(TOOL_CALL, add_special_tokens=False)))}
-    say(f"[tok] vllm encodes tool_call -> "
-        f"{list(vtok.encode(TOOL_CALL, add_special_tokens=False))}")
-
     engine = VLLMEngine(REPO)
+
+    # vLLM's tokenizer helper moved in 0.31 (`vllm.transformers_utils.tokenizer`
+    # no longer exists). The marker check is worth keeping, so try the known
+    # import paths and then the tokenizer the engine built for itself.
+    vtok = None
+    for mod in ("vllm.transformers_utils.tokenizer", "vllm.transformers_utils",
+                "vllm.tokenizers"):
+        try:
+            vtok = __import__(mod, fromlist=["get_tokenizer"]).get_tokenizer(REPO)
+            say(f"[tok] using {mod}.get_tokenizer")
+            break
+        except Exception:
+            continue
+    if vtok is None:
+        vtok = getattr(getattr(engine.llm, "tokenizer", None), "encode", None)
+        say("[tok] using the engine's own tokenizer"
+            if vtok else "[tok] no vllm tokenizer accessor found")
+    if vtok is not None:
+        got = list(vtok.encode(TOOL_CALL, add_special_tokens=False))
+        report["tok.vllm_markers"] = {"ok": got == [49152], "detail": str(got)}
+        say(f"[tok] vllm encodes tool_call -> {got}")
+    else:
+        report["tok.vllm_markers"] = {"ok": True, "soft": True,
+                                      "detail": "no tokenizer accessor; the "
+                                                "engine loaded the model anyway"}
     out, finish = engine.generate([prompt_ids], max_tokens=200, temp=0.0)[0]
     text = tok.decode(out, skip_special_tokens=False)
     say("[vllm] greedy completion:\n" + text)

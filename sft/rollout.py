@@ -118,6 +118,18 @@ def build_model_from_hf(hf, LLaMA):
 
 
 # ------------------------------------------------------------------ engines
+def _token_prompts(prompts):
+    """vLLM's prompt wrapper moved between versions (0.31 has no
+    `vllm.transformers_utils.tokenizer`, and `vllm.inputs.TokensPrompt` is not
+    guaranteed either). The dict form {"prompt_token_ids": [...]} is the stable
+    interface, so try the class first and fall back to that."""
+    try:
+        from vllm.inputs import TokensPrompt
+        return [TokensPrompt(prompt_token_ids=list(p)) for p in prompts]
+    except Exception:
+        return [{"prompt_token_ids": list(p)} for p in prompts]
+
+
 class VLLMEngine:
     """vLLM, fed token ids (never text) so the prompt cannot be re-tokenised."""
 
@@ -131,11 +143,9 @@ class VLLMEngine:
 
     def generate(self, prompts, max_tokens=256, temp=1.0, top_p=0.95, seed=0):
         from vllm import SamplingParams
-        from vllm.inputs import TokensPrompt
         sp = SamplingParams(temperature=temp, top_p=top_p, max_tokens=max_tokens,
                             seed=seed, detokenize=False)
-        outs = self.llm.generate([TokensPrompt(prompt_token_ids=list(p))
-                                  for p in prompts], sp)
+        outs = self.llm.generate(_token_prompts(prompts), sp)
         res = []
         for o in outs:
             c = o.outputs[0]
