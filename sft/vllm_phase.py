@@ -123,13 +123,16 @@ def try_spec(spec, report):
     # vllm/entrypoints/llm.py, so it fires when `LLM(...)` is constructed rather
     # than at import, and a retry around the import never sees it. vLLM 0.31's own
     # pins are internally inconsistent (torch 2.13.0, torchaudio 2.11.0), so no
-    # version pair can agree; what disagrees is the CUDA *build*. This is a
-    # text-only run, so the audio stack goes.
-    say("[vllm] removing torchaudio/torchvision (text-only; dodges the "
-        "torch/torchaudio CUDA guard)")
-    for pkg in ("torchaudio", "torchvision"):
-        subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "-q", pkg],
-                       check=False)
+    # version pair can agree; what disagrees is the CUDA *build*.
+    #
+    # torchaudio only. torchvision has to stay: kernel_warmup() imports
+    # vllm.models.minimax_m3... -> transformers_utils.processors.minimax_m3 ->
+    # torchvision.transforms, so removing it turns a CUDA-version complaint into
+    # "Engine core initialization failed" (smoke kernel v12).
+    say("[vllm] removing torchaudio only (text-only; dodges the torch/torchaudio "
+        "CUDA guard; torchvision stays because kernel_warmup imports it)")
+    subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "-q",
+                    "torchaudio"], check=False)
     try:
         import torch
         vllm, current_platform = import_vllm()
