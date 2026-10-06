@@ -83,6 +83,40 @@ def render_prefix(tok, msgs):
     return ids
 
 
+def cfg_get(cfg, name, default=None):
+    """Read a config field across transformers versions.
+
+    Newer transformers moved rope_theta under `rope_parameters` and stopped
+    storing `head_dim`, so `cfg.rope_theta` raises AttributeError on the Kaggle
+    image — found by the vLLM smoke kernel, which died on exactly that before it
+    ever reached the engine.
+    """
+    if hasattr(cfg, name):
+        return getattr(cfg, name)
+    rope = getattr(cfg, "rope_parameters", None)
+    if name == "rope_theta":
+        if isinstance(rope, dict) and "rope_theta" in rope:
+            return rope["rope_theta"]
+        if rope is not None and not isinstance(rope, dict):
+            return rope
+    return default
+
+
+def build_model_from_hf(hf, LLaMA):
+    """Instantiate our LLaMA from an HF config + state dict."""
+    cfg = hf.config
+    head_dim = (cfg_get(cfg, "head_dim")
+                or cfg.hidden_size // cfg.num_attention_heads)
+    m = LLaMA(vocab_size=cfg.vocab_size, dim=cfg.hidden_size,
+              n_layers=cfg.num_hidden_layers, n_heads=cfg.num_attention_heads,
+              n_kv_heads=cfg_get(cfg, "num_key_value_heads", cfg.num_attention_heads),
+              head_dim=head_dim, ffn_dim=cfg.intermediate_size,
+              rope_theta=float(cfg_get(cfg, "rope_theta", 10000.0)),
+              rms_eps=float(cfg_get(cfg, "rms_norm_eps", 1e-5)))
+    m.load_state_dict(_hf_to_ours(hf.state_dict()), strict=False)
+    return m
+
+
 # ------------------------------------------------------------------ engines
 class VLLMEngine:
     """vLLM, fed token ids (never text) so the prompt cannot be re-tokenised."""
@@ -123,16 +157,9 @@ class KVEngine:
         self.tok = AutoTokenizer.from_pretrained(repo or model_dir)
         hf = LlamaForCausalLM.from_pretrained(repo or model_dir,
                                              torch_dtype=torch.float32).eval()
-        c = hf.config
-        m = LLaMA(vocab_size=c.vocab_size, dim=c.hidden_size,
-                  n_layers=c.num_hidden_layers, n_heads=c.num_attention_heads,
-                  n_kv_heads=c.num_key_value_heads,
-                  head_dim=c.hidden_size // c.num_attention_heads,
-                  ffn_dim=c.intermediate_size, rope_theta=float(c.rope_theta),
-                  rms_eps=float(c.rms_norm_eps))
-        m.load_state_dict(_hf_to_ours(hf.state_dict()), strict=False)
+        self.model = build_model_from_hf(hf, LLaMA)
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = m.eval().to(self.device)
+        self.model = self.model.eval().to(self.device)
         self.max_len = max_len
         self._generate = kv_generate
 
@@ -140,9 +167,19 @@ class KVEngine:
         res = []
         for p in prompts:
             p = list(p)[-self.max_len:]
-            ids = self._generate(self.model, [p], max_new=max_tokens, temp=temp,
-                                 top_p=top_p, seed=seed)[0]
-            stopped = IM_END_ID in ids
+            # LLaMA.forward casts the residual stream to fp16 on CUDA, so the
+            # fp32 weights must be under autocast — the state training ran in
+            # (accelerate mixed_precision="fp16"). Without it the matmuls meet
+            # Half activations against float weights and raise.
+            with self.torch.autocast(self.device, self.torch.float16,
+                                     enabled=self.device == "cuda"):
+                ids = self._generate(self.model, [p], max_new=max_tokens,
+                                     temp=temp, top_p=top_p, seed=seed)[0]
+            # kv_cache.generate drops the eos id rather than returning it, so
+            # "did it stop on im_end" is read off the length: it breaks out of
+            # the loop when the row finishes, so a short generation means it
+            # stopped and a full-length one means it ran to the cap.
+            stopped = len(ids) < max_tokens
             res.append((list(ids), "stop" if stopped else "length"))
         return res
 
