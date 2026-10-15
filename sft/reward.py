@@ -228,6 +228,97 @@ def score_grounded(final, results):
     """0..1. Every returned entity is named in the answer *and* its own value is
     attached to it.
 
+    `results` is tool output in the env's shape. `score_grounded_pairs` takes the
+    (entity, value) pairs directly, which is what DPO mining needs: the mock env
+    returns `{"city": ..., "temp": ...}` but a mined SFT row returns arbitrary
+    JSON, so the miner extracts pairs and hands them over. One grader, two
+    callers -- do not write a second one, the clause/monotone split below is the
+    part that took three attempts to get right.
+    """
+    return score_grounded_pairs(final, _entities_from_results(results))
+
+
+_DIGIT_GROUP = re.compile(r"(?<=\d),(?=\d{3}\b)")
+_CURRENCY = re.compile(r"[$€£¥]")
+# U+2212 MINUS SIGN and U+2013/2014 dashes show up constantly in prose answers
+_DASHES = {"−": "-", "–": "-", "—": "-", "‒": "-", "－": "-"}
+
+
+def normalize_text(text):
+    """Lowercase, drop digit-group separators and currency signs, fold dashes.
+
+    Only digit-adjacent commas are removed, never spaces: entity spans are found
+    by regex over the same string and "New York" must survive intact.
+    """
+    t = (text or "").lower()
+    for k, v in _DASHES.items():
+        t = t.replace(k, v)
+    t = _CURRENCY.sub("", t)
+    t = _DIGIT_GROUP.sub("", t)
+    return t
+
+
+def normalize_value(value):
+    return normalize_text(str(value)).strip()
+
+
+def first_value_pos(text_norm, value):
+    """Where this value is first quoted, or -1. Position arithmetic matters here
+    because the monotone test slices by it, so it has to agree with
+    `value_present` about what counts as a mention."""
+    v = normalize_value(value)
+    if not v:
+        return -1
+    p = text_norm.find(v)
+    if p >= 0:
+        return p
+    for m in re.finditer(r"-?\d+(?:\.\d+)?", text_norm):
+        if value_present(m.group(0), value):
+            return m.start()
+    return -1
+
+
+def value_present(text_norm, value):
+    """Is this value quoted in an already-normalised text?
+
+    Substring first (catches "0.3476" anywhere), then float equality (catches
+    "27,345.80" vs 27345.8 and "-0.52" vs "−0.52 %"), then prefix equality for
+    values the answer rounds or rescales ("863.45 billion" vs 863450000000).
+
+    Without these, mining real SFT prose fails at a 23% gold-binding rate while
+    the harness's own values (18.4 / 22.1) pass fine — the mock env never
+    formats a number.
+    """
+    v = normalize_value(value)
+    if not v:
+        return False
+    if v in text_norm:
+        return True
+    try:
+        fv = float(v)
+    except ValueError:
+        return False
+    # float equality over every number the answer actually prints
+    for m in re.finditer(r"-?\d+(?:\.\d+)?", text_norm):
+        try:
+            if abs(float(m.group(0)) - fv) <= 1e-9 * max(1.0, abs(fv)):
+                return True
+        except ValueError:
+            continue
+    # rescaled / rounded: 863.45 for 863450000000, 123 for 123450
+    for m in re.finditer(r"-?\d+(?:\.\d+)?", text_norm):
+        t = m.group(0)
+        for suf in ("", "k", "m", "b", "billion", "million", "thousand"):
+            scale = {"": 1, "k": 1e3, "m": 1e6, "b": 1e9, "billion": 1e9,
+                     "million": 1e6, "thousand": 1e3}[suf]
+            if abs(float(t) * scale - fv) <= 1e-6 * max(1.0, abs(fv)):
+                return True
+    return False
+
+
+def score_grounded_pairs(final, pairs):
+    """The graded part of `score_grounded`, on explicit (entity, value) pairs.
+
     Two ways to count as bound, because the model's two real failure shapes need
     different tests:
 
@@ -244,44 +335,77 @@ def score_grounded(final, results):
     to fix. Naming both facts somewhere in the answer is what the model already
     does (8/8 mech on multi_tool), so a bag-of-facts check teaches nothing.
     """
-    pairs = _entities_from_results(results)
+    pairs = [(str(e), str(v)) for e, v in (pairs or [])]
     if not pairs:
         return 0.0
-    text = (final or "").lower()
+    text = normalize_text(final)
+
+    # Every pair is scored independently, so one entity carrying several values
+    # (Kampala -> latitude *and* longitude) can reach 1.0. Keying on entity names
+    # instead would cap such a row at 1/len(values), which is invisible in the
+    # mock env (one value per entity) and silently halves the score of every
+    # mined multi-column row.
+    want = {(e.lower(), v.lower()) for e, v in pairs}
+    bound = set()
 
     # clause hits: cut each entity's span at the next entity mention
     names = sorted({e.lower() for e, _ in pairs})
     marks = sorted((m.start(), n) for n in names
                    for m in re.finditer(re.escape(n), text))
-    clause = set()
-    for entity, value in pairs:
-        en = entity.lower()
+    for entity, value in want:
         for i, (pos, n) in enumerate(marks):
-            if n != en:
+            if n != entity:
                 continue
             end = marks[i + 1][0] if i + 1 < len(marks) else len(text)
-            if value.lower() in text[pos:end]:
-                clause.add(en)
+            if value_present(text[pos:end], value):
+                bound.add((entity, value))
                 break
 
     # monotone pairing: k-th first-mentioned entity with the k-th first-printed
-    # value, accepted only when every name precedes its own value
+    # value, accepted only when every name precedes its own value. Deduped to
+    # first occurrences so an entity named once is one slot, and only the pairs
+    # that actually exist in `want` are credited — a list-shaped answer can bind
+    # an entity to a value it was never supposed to carry.
     aligned = set()
-    ent_first = sorted(((text.find(e.lower()), e.lower()) for e, _ in pairs),
+    ent_first = sorted({(text.find(e), e) for e, _ in want if text.find(e) >= 0},
                        key=lambda t: t[0])
-    val_first = sorted(((text.find(v.lower()), v) for _, v in pairs),
+    val_first = sorted({(p, v) for _, v in want
+                        for p in [first_value_pos(text, v)] if p >= 0},
                        key=lambda t: t[0])
-    if (len(ent_first) == len(val_first)
+    if (len(ent_first) == len(val_first) and len(ent_first) == len(want)
             and all(p >= 0 for p, _ in ent_first)
             and all(p >= 0 for p, _ in val_first)
-            and all(ent_first[i][0] < val_first[i][0] for i in range(len(ent_first)))):
-        by_entity = {e.lower(): v for e, v in pairs}
+            and all(ent_first[i][0] < val_first[i][0]
+                    for i in range(len(ent_first)))):
         for (_, en), (_, val) in zip(ent_first, val_first):
-            if by_entity.get(en) == val:
-                aligned.add(en)
+            if (en, val) in want:
+                aligned.add((en, val))
 
-    bound = clause | aligned
-    return len(bound) / len(pairs)
+    bound |= aligned
+    return len(bound) / len(want)
+
+
+def entities_in(text, pairs):
+    """The subset of pair entities this text mentions at all."""
+    t = (text or "").lower()
+    return {e.lower() for e, _ in pairs if _mentions(t, e.lower())}
+
+
+def _mentions(hay, needle):
+    return (len(needle) >= 2 and
+            re.search(r"(?<![a-z0-9])" + re.escape(needle) + r"(?![a-z0-9])", hay)
+            is not None)
+
+
+def same_entity_set(a, b, pairs):
+    """True when two answers name exactly the same entities.
+
+    This is the style-transfer diagnostic for DPO mining (`rl/dpo_pairs.py`): a
+    pair whose rejected side names a *different* entity set than gold is not a
+    binding failure, it is a different answer, and the gradient it produces is
+    mostly about prose style rather than about value/entity alignment.
+    """
+    return entities_in(a, pairs) == entities_in(b, pairs)
 
 
 def score_correct(task, calls, results, final):

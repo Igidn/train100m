@@ -468,6 +468,43 @@ class LLaMA(nn.Module):
         if isinstance(m, (nn.Linear, nn.Embedding)):
             nn.init.normal_(m.weight, std=0.02)
 
+    def completion_logprob(self, tokens, targets, loss_mask, ce_chunk=4096):
+        """Sum of log p(target) over the masked positions, per batch row.
+
+        The DPO primitive: `log pi(y | x)` restricted to the completion span.
+        Returns (B,) float32. Same chunked fp32 head as `forward`, so a
+        [32k, 49154] logit tensor never lands in one piece -- the reason this is
+        a method on the model rather than `log_softmax(model(x)[..., :-1])`.
+
+        Shift convention is `forward`'s, deliberately: `targets` is ALREADY
+        shifted against `tokens` (position t predicts targets[t]) and
+        `loss_mask` is parallel to both, so no shift happens here. Callers pass
+        x = tokens[:-1], y = tokens[1:], mask = mask[1:] exactly as the SFT
+        trainer does. Doing the shift internally instead is an off-by-one that
+        still produces finite, plausible-looking logprobs.
+        """
+        bsz, seq = tokens.shape
+        x = self.tok_emb(tokens)
+        cos, sin = self._rope_tables(seq, tokens.device, x.dtype)
+        for blk in self.blocks:
+            x = blk(x, cos, sin)
+        x = self.norm(x)
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            h = x.half() if x.device.type == "cuda" else x
+            w = self.lm_head.weight.to(h.dtype)
+            flat_h = h.reshape(-1, h.shape[-1])
+            flat_t = targets.reshape(-1)
+            m = loss_mask.reshape(-1).to(torch.float32)
+            row = torch.arange(bsz, device=h.device).unsqueeze(1).expand(bsz, seq
+                                                                        ).reshape(-1)
+            out = torch.zeros(bsz, device=h.device, dtype=torch.float32)
+            for i in range(0, flat_h.shape[0], ce_chunk):
+                logits = F.linear(flat_h[i:i + ce_chunk], w)
+                lp = torch.log_softmax(logits.float(), dim=-1)
+                tok_lp = lp.gather(1, flat_t[i:i + ce_chunk, None]).squeeze(1)
+                out = out.index_add(0, row[i:i + ce_chunk], tok_lp * m[i:i + ce_chunk])
+            return out
+
     def forward(self, tokens, targets=None, ce_chunk=4096, loss_mask=None,
                 cache=None, pos_offset=0):
         """tokens: (B, T) int64. Returns (loss,) if targets given, else logits.
