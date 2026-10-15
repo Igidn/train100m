@@ -349,7 +349,9 @@ def main():
                  key=lambda p: int(p.rsplit("-", 1)[1].split(".")[0]))
     if cks:
         ck = torch.load(cks[-1], map_location="cpu", weights_only=False)
-        model.load_state_dict(ck["model"], strict=True)
+        # saved via acc.get_state_dict() -> keys are unprefixed, and DDP's own
+        # state_dict carries a `module.` prefix; load into the inner module.
+        unw.load_state_dict(ck["model"], strict=True)
         opt.load_state_dict(ck["opt"])
         start_step = int(ck.get("step", 0))
         if main_proc:
@@ -387,7 +389,12 @@ def main():
                 with ctx:
                     x, y, m, ref_c, ref_r, n_c = build_pair_batch(
                         mb, tok, max_len, dev)
-                    lp = model.completion_logprob(x, y, m, ce_chunk=ce_chunk)
+                    # via forward(..., mode="logprob"), NOT unw.completion_logprob:
+                    # DDP only reduces the graph hanging off its own forward
+                    # output, so an inner-module call would train every rank on
+                    # its own unsynced gradient (measured, not assumed).
+                    lp = model(x, y, loss_mask=m, ce_chunk=ce_chunk,
+                               mode="logprob")
                     B = len(mb)
                     pi_c, pi_r = lp[:B], lp[B:]
                     loss, met = dpo_loss(pi_c, pi_r, ref_c[:B], ref_r[:B], beta)

@@ -506,8 +506,16 @@ class LLaMA(nn.Module):
             return out
 
     def forward(self, tokens, targets=None, ce_chunk=4096, loss_mask=None,
-                cache=None, pos_offset=0):
+                cache=None, pos_offset=0, mode="loss"):
         """tokens: (B, T) int64. Returns (loss,) if targets given, else logits.
+
+        mode="logprob": return the per-row summed log p(target) over `loss_mask`
+        (the DPO primitive, `completion_logprob`) instead of the scalar masked
+        mean CE. It lives here so the DPO step can request that tensor through
+        `forward` -- i.e. through `DistributedDataParallel.forward`. DDP only
+        reduces the graph hanging off its own output, so reaching for
+        `model.completion_logprob` on the wrapped module would AttributeError,
+        and via `.module` would silently skip the allreduce.
 
         loss_mask: optional 0/1 tensor parallel to `targets` (already shifted
         like targets). When given, the loss is the mean CE over masked
@@ -521,6 +529,8 @@ class LLaMA(nn.Module):
         phase instead of restarting from 0. Both default to the previous
         behaviour, so training and the battery are unaffected.
         """
+        if mode == "logprob":
+            return self.completion_logprob(tokens, targets, loss_mask, ce_chunk)
         bsz, seq = tokens.shape
         x = self.tok_emb(tokens)
         if x.device.type == "cuda":
