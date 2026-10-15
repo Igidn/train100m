@@ -1,9 +1,16 @@
 *.md
+.env
 .kaggle/
 __pycache__/
 outputs/
+rl/pairs/
 *.pyc
 toktest/val-000.bin
 toktest/val-000.offsets.npy
 toktest/tokenizer.json
 toktest/*.log
+
+
+
+.DS_Store
+
