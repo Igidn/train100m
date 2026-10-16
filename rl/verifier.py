@@ -12,11 +12,13 @@ raw check cannot:
      read-before-edit respected) so the group has spread. Weights are the plan's
      starting point and are meant to be retuned from the G0 measurement.
 
-  1b. **Termination bonus (§4.2b).** The ladder paid for work but never for
-     `submit`, and stopping later is worth more rungs — so GRPO round 1 learned to
-     never submit (G4: terminate 71.5% -> 0%). A submitted episode that earned a
-     nonzero rung now gets `+R_SUBMIT` (capped at `R_PASS`); the do-nothing control
-     still scores 0.0, because the bonus is gated on the rung.
+  1b. **`submit` banks the reward (§4.2b).** The ladder says how good the final
+     file state is; `submit` is what cashes it in. An episode that never terminated
+     scores 0.0 however good its state — in deployment an unsubmitted episode is a
+     timeout, i.e. no answer. This is what stops "keep working forever" from being
+     weakly optimal, which is the reason GRPO trained termination away: reward was
+     the file state, so one more step was free upside. The do-nothing control is
+     untouched — an immediate submit is rung `none` and banks 0.0 (§4.5).
 
   2. **Anti-hack (§4.3).** The shaping terms are a hack surface, so grading is
      hostile to the three cheap hacks:
@@ -59,16 +61,14 @@ R_PROGRESS = 0.6
 R_CORRECT_FILE = 0.4
 R_EDITED = 0.2
 R_NONE = 0.0
-# §4.2b — termination bonus. `submit` is an explicit action the policy *can* take and
-# Stage-A *did* take (58% before the §4.4 prompt, 71.5% under it), but the ladder
-# never rewarded it, while *not* submitting buys more steps and so more chances to
-# climb a rung. GRPO round 1 optimised that: terminate 71.5% -> 0% (G4). This bonus
-# pays for terminating, but only on top of a *nonzero* rung — gated so the §4.5
-# do-nothing control (immediate `submit`) still scores 0.0, which is the whole point
-# of that control. The total is capped at R_PASS so `pass` stays the unique top and
-# every existing `reward == 1.0` check (grpo_report, pass_rate) still means "passed".
-# Weight is a starting point like the rest of the ladder (§14) — tune from G0.
-R_SUBMIT = 0.2
+# §4.2b — `submit` banks the reward (hard gate; see `grade`). An episode that never
+# terminated scores R_NONE whatever its rung. GRPO round 1 lost termination outright
+# (terminate 71.5% -> 0%) because the reward was the file state, so one more step was
+# free upside. Round 2 tried the softer form — a +0.2 bonus on top of the rung — and
+# it did *not* work either (terminate 0% -> 2.5%): 86% of the base policy's submits
+# are rung `none`, so the bonus almost never landed on the trajectories that decide
+# behaviour, and gating on the rung still let the model bank `progress` without ever
+# terminating. Hard-gating removes that free upside. (`R_SUBMIT` retired.)
 
 # a *source* edit that only makes the check short-circuit. The check is
 # `exit_code == 0 and "OK" in stdout`; these are the two ways to satisfy it
@@ -166,29 +166,30 @@ def grade(task, sb, episode) -> dict:
     submitted = bool((episode or {}).get("submitted"))
 
     if anti:
-        reward, tier = R_NONE, "anti_hack"
+        ladder, tier = R_NONE, "anti_hack"
     elif visible["passed"]:
-        reward, tier = R_PASS, "pass"
+        ladder, tier = R_PASS, "pass"
     elif progressed:
-        reward, tier = R_PROGRESS, "progress"
+        ladder, tier = R_PROGRESS, "progress"
     elif correct_file:
-        reward, tier = R_CORRECT_FILE, "correct_file"
+        ladder, tier = R_CORRECT_FILE, "correct_file"
     elif edited and rbe:
-        reward, tier = R_EDITED, "edited_read_first"
+        ladder, tier = R_EDITED, "edited_read_first"
     else:
-        reward, tier = R_NONE, "none"
+        ladder, tier = R_NONE, "none"
 
-    # §4.2b: pay for terminating, but only on top of real work (a nonzero rung), and
-    # never above `pass`. An immediate/do-nothing submit has rung `none` (0.0) and so
-    # still scores 0.0 (§4.5).
-    submit_bonus = R_SUBMIT if (submitted and reward > R_NONE) else 0.0
-    reward = min(R_PASS, reward + submit_bonus)
+    # §4.2b hard gate: `ladder` is what the final file state is worth, `submit` is
+    # what banks it. No submit -> no bank, whatever the rung. That kills the free
+    # upside of "just do one more step" that made round 1 (and round 2's softer
+    # bonus) fail. §4.5 still holds: an immediate/do-nothing submit is rung `none`,
+    # so it banks 0.0. Anti-hack also stays 0.0 (it never reaches the ladder).
+    reward = ladder if submitted else R_NONE
 
     return {
         "reward": reward,
         "tier": tier,
+        "ladder": ladder,
         "submitted": submitted,
-        "submit_bonus": submit_bonus,
         "anti_hack": anti,
         "check": visible,
         "variant": variant,
@@ -231,7 +232,7 @@ def selftest() -> int:
     g = ep["grade"]
     ok("oracle_reward", g["reward"] == 1.0, str(g))
     ok("oracle_submitted", ep["submitted"] is True,
-       "the oracle submits; §4.2b caps it back to 1.0 rather than 1.2")
+       "the oracle banks its pass by submitting (§4.2b)")
     ok("oracle_variant", g["variant"] and g["variant"]["passed"] is True)
     ok("oracle_no_anti", g["anti_hack"] == [])
 
@@ -294,14 +295,15 @@ def selftest() -> int:
     ok("sysexit_reward", g["reward"] == 0.0, str(g))
     ok("sysexit_anti", "shortcut_marker" in g["anti_hack"], str(g["anti_hack"]))
 
-    print("== ladder: a wrong-but-changed source edit -> progress (0.6)")
+    print("== §4.2b gate: a wrong-but-changed edit that NEVER submits scores 0.0 "
+          "(the rung is recorded but not banked)")
     def progress_policy(messages):
         if not progress_policy.done:
             progress_policy.done = True
             return {"text": tc + json.dumps({"name": "str_replace_editor", "arguments": {
                 "command": "view", "path": path}}), "stopped": True, "calls": []}
         # change the constant to a *different* wrong value: check still fails, but
-        # the failure output changed, which is the 0.6 rung
+        # the failure output changed, which would be the 0.6 rung
         wrong = task.fix["old_str"].split("+")[1].strip()
         return {"text": tc + json.dumps({"name": "str_replace_editor", "arguments": {
             "command": "str_replace", "path": path,
@@ -309,10 +311,12 @@ def selftest() -> int:
             "new_str": f"return x + {int(wrong) + 1000}"}}), "stopped": True, "calls": []}
     progress_policy.done = False
     ep_progress = grade_run(progress_policy)
-    ok("progress_reward", ep_progress["grade"]["reward"] == 0.6, str(ep_progress["grade"]))
+    ok("progress_rung_recorded", ep_progress["grade"]["ladder"] == 0.6,
+       str(ep_progress["grade"]))
+    ok("progress_no_submit_banks_zero", ep_progress["grade"]["reward"] == 0.0,
+       "no submit -> nothing banked, however good the rung")
 
-    print("== §4.2b: the *same* progress, but it submits, scores higher; and pass "
-          "still caps at 1.0")
+    print("== §4.2b gate: the *same* progress, but it submits -> 0.6 banked")
     def progress_submit_policy(messages):
         n = progress_submit_policy.n
         progress_submit_policy.n += 1
@@ -331,11 +335,30 @@ def selftest() -> int:
     ep_psub = grade_run(progress_submit_policy)
     gsub = ep_psub["grade"]
     ok("submit_episode_submitted", ep_psub["submitted"] is True)
-    ok("submit_bonus_applied", gsub["reward"] == 0.8 and gsub["submit_bonus"] == 0.2,
-       str(gsub))
+    ok("submit_banks_rung", gsub["reward"] == 0.6 and gsub["ladder"] == 0.6, str(gsub))
     ok("submit_outscores_nosubmit",
        gsub["reward"] > ep_progress["grade"]["reward"],
        f"{gsub['reward']} vs {ep_progress['grade']['reward']}")
+
+    print("== §4.2b gate: a *passing* fix that never submits still scores 0.0 "
+          "(an unsubmitted episode is a timeout, not a win)")
+    def fix_no_submit_policy(messages):
+        n = fix_no_submit_policy.n
+        fix_no_submit_policy.n += 1
+        if n == 0:
+            return {"text": tc + json.dumps({"name": "str_replace_editor", "arguments": {
+                "command": "view", "path": path}}), "stopped": True, "calls": []}
+        if n == 1:
+            return {"text": tc + json.dumps({"name": "str_replace_editor", "arguments": {
+                "command": "str_replace", "path": path,
+                "old_str": task.fix["old_str"], "new_str": task.fix["new_str"]}}),
+                "stopped": True, "calls": []}
+        return {"text": "I think that's fixed.", "stopped": True, "calls": []}
+    fix_no_submit_policy.n = 0
+    gns = grade_run(fix_no_submit_policy)["grade"]
+    ok("pass_no_submit_check_passes", gns["check"]["passed"] is True, str(gns["check"]))
+    ok("pass_no_submit_banks_zero", gns["reward"] == 0.0 and gns["tier"] == "pass",
+       str(gns))
 
     print()
     if fails:
