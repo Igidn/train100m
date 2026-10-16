@@ -25,15 +25,24 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import socket
 import time
+import urllib.error
 import urllib.request
 
 try:
-    from .agent_env import TOOLS, generate_task, parse_calls, run_episode, system_prompt
+    from .agent_env import (TOOLS, HOLDOUT_SEED0, generate_task, parse_calls,
+                            run_episode, system_prompt)
 except ImportError:  # run as a plain script (python rl/agent_rollout.py)
-    from agent_env import TOOLS, generate_task, parse_calls, run_episode, system_prompt
+    from agent_env import (TOOLS, HOLDOUT_SEED0, generate_task, parse_calls,
+                           run_episode, system_prompt)
 
 OLLAMA = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434/api/chat")
+# A long Mac generation (100 tasks x G=16) holds the Ollama server for ~30 min;
+# a single transient 5xx/connection reset must not kill the whole pool, so the
+# serving client retries with backoff and, if it still fails, fails soft (one
+# empty turn) rather than raising out of the episode loop.
+TRANSIENT_RETRIES = int(os.environ.get("OLLAMA_RETRIES", "5"))
 DECLARED = {"bash": ("command",),
             "str_replace_editor": ("command", "path"),
             "submit": ()}
@@ -60,12 +69,36 @@ class OllamaPolicy:
                                "num_predict": self.num_predict, "num_ctx": self.num_ctx}}
         if self.send_tools:
             payload["tools"] = TOOLS
-        req = urllib.request.Request(self.url, data=json.dumps(payload).encode(),
-                                     headers={"Content-Type": "application/json"})
-        t0 = time.time()
-        with urllib.request.urlopen(req, timeout=self.timeout) as r:
-            resp = json.load(r)
-        dt = time.time() - t0
+        body = json.dumps(payload).encode()
+        last_err = None
+        for attempt in range(TRANSIENT_RETRIES):
+            try:
+                req = urllib.request.Request(
+                    self.url, data=body,
+                    headers={"Content-Type": "application/json"})
+                t0 = time.time()
+                with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                    resp = json.load(r)
+                dt = time.time() - t0
+                break
+            except urllib.error.HTTPError as e:
+                if 400 <= e.code < 500:      # our bug (bad model/args): do not loop
+                    raise
+                last_err = e
+            except (urllib.error.URLError, socket.timeout, OSError) as e:
+                last_err = e
+            wait = min(2 ** attempt, 30)
+            print(f"  ! ollama transient error ({last_err}); retry "
+                  f"{attempt + 1}/{TRANSIENT_RETRIES - 1} in {wait}s", flush=True)
+            time.sleep(wait)
+        else:
+            # Fail soft: end this one episode and let the verifier grade it (it
+            # lands on the 0.0 rung). Killing a 1,600-episode pool over one turn
+            # is the worse outcome.
+            print(f"  ! ollama gave up after {TRANSIENT_RETRIES} tries "
+                  f"({last_err}); ending episode early", flush=True)
+            return {"text": "", "stopped": True, "calls": [], "secs": 0.0,
+                    "prompt_tok": 0, "eval_tok": 0, "error": str(last_err)}
         msg = resp.get("message") or {}
         content = msg.get("content") or ""
         calls = []
@@ -147,11 +180,18 @@ def _arg_ok(name, args):
 
 
 def behavior_metrics(episodes):
-    """The RL_PLAN §0 targets, computed from recorded trajectories."""
+    """The RL_PLAN §0 targets, computed from recorded trajectories.
+
+    `verify_with_check` is the §0.1 correction of the weak `verify_before_submit`:
+    it asks whether the episode ran *the task's own check command* after its last
+    edit, not whether it ran "any bash". Of the 57 Stage-A submits, 20 "verified"
+    with a bare `ls`, which the old metric counted as a pass.
+    """
     n = len(episodes) or 1
     valid_n = valid_d = 0
     rbe_hit = rbe_den = 0
     vbs_hit = vbs_den = 0
+    vbc_hit = vbc_den = 0
     for ep in episodes:
         seq = _calls_in_order(ep)
         viewed, last_edit, last_bash = set(), -1, -1
@@ -172,6 +212,12 @@ def behavior_metrics(episodes):
         if last_edit >= 0:
             vbs_den += 1
             vbs_hit += 1 if last_bash > last_edit else 0
+            check_cmd = str((ep.get("check") or {}).get("cmd", "")).strip()
+            vbc_den += 1
+            if check_cmd and any(
+                    name == "bash" and str(a.get("command", "")).strip() == check_cmd
+                    for name, a in seq[last_edit + 1:]):
+                vbc_hit += 1
 
     def rate(a, b):
         return round(a / b, 3) if b else None
@@ -183,6 +229,7 @@ def behavior_metrics(episodes):
         "tool_valid": rate(valid_n, valid_d),
         "read_before_edit": rate(rbe_hit, rbe_den),
         "verify_before_submit": rate(vbs_hit, vbs_den),
+        "verify_with_check": rate(vbc_hit, vbc_den),
         "mean_steps": round(sum(e["steps"] for e in episodes) / n, 2),
     }
 
@@ -209,6 +256,8 @@ def main() -> int:
     ap.add_argument("--url", default=OLLAMA)
     ap.add_argument("--tasks", type=int, default=8)
     ap.add_argument("--seed0", type=int, default=0)
+    ap.add_argument("--holdout", action="store_true",
+                    help="use the held-out eval seed range (RL_PLAN_2 §6.1)")
     ap.add_argument("--out", default="trajectories.jsonl")
     ap.add_argument("--oracle", action="store_true")
     ap.add_argument("--control", action="store_true")
@@ -221,7 +270,8 @@ def main() -> int:
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
 
-    tasks = [generate_task(a.seed0 + i) for i in range(a.tasks)]
+    tasks = [generate_task(a.seed0 + i + (HOLDOUT_SEED0 if a.holdout else 0))
+             for i in range(a.tasks)]
 
     if a.dry:
         print(system_prompt("<workdir>"))
@@ -260,6 +310,7 @@ def selftest() -> int:
     ok("gold.check_pass=1", mg["check_pass_rate"] == 1.0)
     ok("gold.read_before_edit=1", mg["read_before_edit"] == 1.0)
     ok("gold.verify_before_submit=1", mg["verify_before_submit"] == 1.0)
+    ok("gold.verify_with_check=1", mg["verify_with_check"] == 1.0)
     ok("gold.loop=0", mg["loop_rate"] == 0.0)
     ok("gold.tool_valid=1", mg["tool_valid"] == 1.0)
     ok("ctrl.check_pass=0", mc["check_pass_rate"] == 0.0)

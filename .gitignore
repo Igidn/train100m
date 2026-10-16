@@ -4,6 +4,8 @@
 __pycache__/
 outputs/
 rl/pairs/
+rl/samples/
+rl/mimo/
 *.pyc
 toktest/val-000.bin
 toktest/val-000.offsets.npy

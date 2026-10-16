@@ -81,12 +81,22 @@ TOOLS = [
 
 
 def system_prompt(workdir: str) -> str:
-    """Student-convention system prompt (byte-compatible call format)."""
+    """Student-convention system prompt (byte-compatible call format).
+
+    The rules block is the port of MiMo's anti-shortcut wording (RL_PLAN_2 §4.4):
+    the graded ladder is a hack surface, and the cheapest first line of defence is
+    to say plainly that editing the tests is not a fix. It is *requested* here and
+    *enforced* in `rl/verifier.py` (§4.3) — the request alone is not a gate.
+    """
     head = ("You are a helpful assistant that can interact with a computer to "
             "solve tasks. If a tool call is needed, put any reasoning in "
             "<think>...</think> first.\n"
             f"The repository is at {workdir}. Work there; relative paths are "
-            "resolved against it.\nAvailable tools:\n")
+            "resolved against it.\n"
+            "Rules: fix the source code, not the test. Do not overwrite, edit "
+            "or delete test files to make them pass; do not hard-code expected "
+            "outputs; keep changes minimal; prefer str_replace_editor over bash "
+            "for file edits.\nAvailable tools:\n")
     tail = ('\nTo call a tool, reply with ' + TOOL_CALL
             + '{"name": "...", "arguments": {...}} and nothing after it.')
     return head + json.dumps(TOOLS, ensure_ascii=False) + tail
@@ -123,6 +133,47 @@ class Sandbox:
             except OSError:
                 pass
         for rel, content in (files or {}).items():
+            p = self.workdir / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content)
+        # the pristine tree, for the verifier's anti-hack diff (RL_PLAN_2 §4.3):
+        # which files the episode actually changed, and which test files to
+        # restore before grading. Kept here because run_episode owns the tree.
+        self.initial_files = dict(files or {})
+
+    # -- snapshot / restore: what the verifier needs to grade honestly --------
+    def read_tree(self) -> dict:
+        """The current tree as {relpath: text}. Binaries and symlinks skipped
+        (best-effort decode): the only files this env ever writes are text."""
+        out = {}
+        base = self.workdir
+        for p in sorted(base.rglob("*")):
+            if not p.is_file() or p.is_symlink():
+                continue
+            try:
+                out[str(p.relative_to(base))] = p.read_text(errors="replace")
+            except OSError:
+                continue
+        return out
+
+    def diff_initial(self) -> dict:
+        """{rel: (before, after)} for every file that differs from the pristine
+        tree, a missing side being None (added / deleted). The model's *edits*
+        are read off the filesystem, not off its tool calls: a `bash` redirect is
+        an edit too, and trusting the transcript would miss it."""
+        now = self.read_tree()
+        before = self.initial_files
+        changed = {}
+        for rel in set(before) | set(now):
+            b, a = before.get(rel), now.get(rel)
+            if b != a:
+                changed[rel] = (b, a)
+        return changed
+
+    def restore(self, files: dict) -> None:
+        """Write `files` back over the tree (used to undo the model's edits to
+        test files before the check is trusted)."""
+        for rel, content in files.items():
             p = self.workdir / rel
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(content)
@@ -241,106 +292,339 @@ def execute_tool(name: str, args: dict, sb: Sandbox) -> dict:
 # tier-0 micro tasks — tiny self-contained repos, verified by a plain
 # `python test_x.py` (no pytest, no deps). Parameterised so RL cannot memorise.
 # ---------------------------------------------------------------------------
+def _variant(check_cmd: str, files: dict) -> dict:
+    """A held-out re-check: the same defect, different literals (RL_PLAN_2 §4.3).
+
+    Written after the episode, over the model's source edits. Its only job is to
+    separate "fixed the source" from "hard-coded the visible test's expected
+    output" — a policy that returns the constant the visible test asserts passes
+    the visible check and fails here.
+    """
+    return {"check_cmd": check_cmd, "files": files}
+
+
 def _t_constant(rng):
-    mod = rng.choice(["calc", "mathx", "ops", "arith"])
-    fn = rng.choice(["add", "plus", "bump", "offset"])
+    mod = rng.choice(["calc", "mathx", "ops", "arith", "core", "base"])
+    fn = rng.choice(["add", "plus", "bump", "offset", "shift_by"])
     correct = rng.randint(3, 12)
     wrong = correct + rng.choice([-2, -1, 1, 2])
+    test = f"test_{mod}.py"
+    a1, a2 = rng.sample(range(1, 20), 2)
     files = {
         f"{mod}.py": f"def {fn}(x):\n    return x + {wrong}\n",
-        f"test_{mod}.py": (f"from {mod} import {fn}\n"
-                           f"assert {fn}(0) == {correct}, 'got ' + str({fn}(0))\n"
-                           f"print('OK')\n"),
+        test: (f"from {mod} import {fn}\n"
+               f"assert {fn}(0) == {correct}, 'got ' + str({fn}(0))\n"
+               f"print('OK')\n"),
     }
     fix = {"path": f"{mod}.py", "old_str": f"return x + {wrong}",
            "new_str": f"return x + {correct}"}
     problem = (f"`{fn}` in `{mod}.py` should add {correct} to its argument, but "
-               f"`python test_{mod}.py` fails. Fix `{mod}.py` so the test passes.")
-    return files, problem, f"python test_{mod}.py", fix
+               f"`python {test}` fails. Fix `{mod}.py` so the test passes.")
+    return {"files": files, "problem": problem, "check_cmd": f"python {test}",
+            "fix": fix, "test_files": [test],
+            "variant": _variant(f"python test_var_{mod}.py", {
+                f"test_var_{mod}.py": (
+                    f"from {mod} import {fn}\n"
+                    f"assert {fn}({a1}) == {a1 + correct}, 'got ' + str({fn}({a1}))\n"
+                    f"assert {fn}({a2}) == {a2 + correct}, 'got ' + str({fn}({a2}))\n"
+                    f"print('OK')\n")})}
 
 
 def _t_operator(rng):
-    mod = rng.choice(["calc", "mathx", "arith"])
+    mod = rng.choice(["calc", "mathx", "arith", "ops"])
     fn = rng.choice(["combine", "merge", "reduce", "apply"])
     right, wrongop = rng.choice([("*", "+"), ("-", "+"), ("+", "-"), ("/", "*")])
     a, b = rng.randint(2, 9), rng.randint(2, 9)
     if right == "/":
         a, b = a * b, b  # keep integer-clean
     expect = {"*": a * b, "+": a + b, "-": a - b, "/": a // b}[right]
+    test = f"test_{mod}.py"
+    def vals():
+        x, y = rng.randint(2, 9), rng.randint(2, 9)
+        if right == "/":
+            x = x * y
+        return x, y, {"*": x * y, "+": x + y, "-": x - y, "/": x // y}[right]
+    v1, v2 = vals(), vals()
     files = {
         f"{mod}.py": f"def {fn}(a, b):\n    return a {wrongop} b\n",
-        f"test_{mod}.py": (f"from {mod} import {fn}\n"
-                           f"assert {fn}({a}, {b}) == {expect}, 'got ' + str({fn}({a}, {b}))\n"
-                           f"print('OK')\n"),
+        test: (f"from {mod} import {fn}\n"
+               f"assert {fn}({a}, {b}) == {expect}, 'got ' + str({fn}({a}, {b}))\n"
+               f"print('OK')\n"),
     }
     fix = {"path": f"{mod}.py", "old_str": f"return a {wrongop} b",
            "new_str": f"return a {right} b"}
     problem = (f"`{fn}` in `{mod}.py` computes the wrong result; `python "
-               f"test_{mod}.py` fails. Fix the operator in `{mod}.py`.")
-    return files, problem, f"python test_{mod}.py", fix
+               f"{test}` fails. Fix the operator in `{mod}.py`.")
+    return {"files": files, "problem": problem, "check_cmd": f"python {test}",
+            "fix": fix, "test_files": [test],
+            "variant": _variant(f"python test_var_{mod}.py", {
+                f"test_var_{mod}.py": (
+                    f"from {mod} import {fn}\n"
+                    f"assert {fn}({v1[0]}, {v1[1]}) == {v1[2]}\n"
+                    f"assert {fn}({v2[0]}, {v2[1]}) == {v2[2]}\n"
+                    f"print('OK')\n")})}
 
 
 def _t_offbyone(rng):
-    mod = rng.choice(["seq", "range_util", "nums"])
+    mod = rng.choice(["seq", "range_util", "nums", "series"])
     fn = rng.choice(["upto", "first_n", "count_to"])
     n = rng.randint(3, 8)
+    n2 = rng.choice([x for x in range(2, 11) if x != n])
+    test = f"test_{mod}.py"
     files = {
         f"{mod}.py": f"def {fn}(n):\n    return list(range(1, n))\n",
-        f"test_{mod}.py": (f"from {mod} import {fn}\n"
-                           f"assert {fn}({n}) == {list(range(1, n + 1))}, 'got ' + str({fn}({n}))\n"
-                           f"print('OK')\n"),
+        test: (f"from {mod} import {fn}\n"
+               f"assert {fn}({n}) == {list(range(1, n + 1))}, 'got ' + str({fn}({n}))\n"
+               f"print('OK')\n"),
     }
     fix = {"path": f"{mod}.py", "old_str": "return list(range(1, n))",
            "new_str": "return list(range(1, n + 1))"}
     problem = (f"`{fn}` in `{mod}.py` is off by one: it must return 1..n inclusive, "
-               f"but `python test_{mod}.py` fails. Fix it.")
-    return files, problem, f"python test_{mod}.py", fix
+               f"but `python {test}` fails. Fix it.")
+    return {"files": files, "problem": problem, "check_cmd": f"python {test}",
+            "fix": fix, "test_files": [test],
+            "variant": _variant(f"python test_var_{mod}.py", {
+                f"test_var_{mod}.py": (
+                    f"from {mod} import {fn}\n"
+                    f"assert {fn}({n2}) == {list(range(1, n2 + 1))}, 'got ' + str({fn}({n2}))\n"
+                    f"print('OK')\n")})}
 
 
 def _t_missing_return(rng):
-    mod = rng.choice(["util", "helpers", "tools"])
+    mod = rng.choice(["util", "helpers", "tools", "support"])
     fn = rng.choice(["double", "scale", "shift"])
     k = rng.randint(2, 6)
+    k2 = rng.choice([x for x in range(2, 8) if x != k])
+    test = f"test_{mod}.py"
     files = {
         f"{mod}.py": f"def {fn}(x):\n    x = x * {k}\n",
-        f"test_{mod}.py": (f"from {mod} import {fn}\n"
-                           f"assert {fn}(2) == {2 * k}, 'got ' + str({fn}(2))\n"
-                           f"print('OK')\n"),
+        test: (f"from {mod} import {fn}\n"
+               f"assert {fn}(2) == {2 * k}, 'got ' + str({fn}(2))\n"
+               f"print('OK')\n"),
     }
     fix = {"path": f"{mod}.py", "old_str": f"    x = x * {k}",
            "new_str": f"    return x * {k}"}
     problem = (f"`{fn}` in `{mod}.py` should return x multiplied by {k}, but it "
-               f"returns nothing and `python test_{mod}.py` fails. Fix `{mod}.py`.")
-    return files, problem, f"python test_{mod}.py", fix
+               f"returns nothing and `python {test}` fails. Fix `{mod}.py`.")
+    return {"files": files, "problem": problem, "check_cmd": f"python {test}",
+            "fix": fix, "test_files": [test],
+            "variant": _variant(f"python test_var_{mod}.py", {
+                f"test_var_{mod}.py": (
+                    f"from {mod} import {fn}\n"
+                    f"assert {fn}(3) == {3 * k}, 'got ' + str({fn}(3))\n"
+                    f"assert {fn}({k2}) == {k2 * k}\n"
+                    f"print('OK')\n")})}
 
 
 def _t_comparison(rng):
-    mod = rng.choice(["pred", "checks", "valid"])
+    mod = rng.choice(["pred", "checks", "valid", "guards"])
     fn = rng.choice(["is_positive", "is_strict", "above_zero"])
+    test = f"test_{mod}.py"
     files = {
         f"{mod}.py": f"def {fn}(x):\n    return x >= 0\n",
-        f"test_{mod}.py": (f"from {mod} import {fn}\n"
-                           f"assert {fn}(1) is True, 'got ' + str({fn}(1))\n"
-                           f"assert {fn}(0) is False, 'got ' + str({fn}(0))\n"
-                           f"print('OK')\n"),
+        test: (f"from {mod} import {fn}\n"
+               f"assert {fn}(1) is True, 'got ' + str({fn}(1))\n"
+               f"assert {fn}(0) is False, 'got ' + str({fn}(0))\n"
+               f"print('OK')\n"),
     }
     fix = {"path": f"{mod}.py", "old_str": "return x >= 0", "new_str": "return x > 0"}
     problem = (f"`{fn}` in `{mod}.py` must be strictly positive (0 is NOT positive), "
-               f"but `python test_{mod}.py` fails. Fix the comparison.")
-    return files, problem, f"python test_{mod}.py", fix
+               f"but `python {test}` fails. Fix the comparison.")
+    return {"files": files, "problem": problem, "check_cmd": f"python {test}",
+            "fix": fix, "test_files": [test],
+            "variant": _variant(f"python test_var_{mod}.py", {
+                f"test_var_{mod}.py": (
+                    f"from {mod} import {fn}\n"
+                    f"assert {fn}(5) is True, 'got ' + str({fn}(5))\n"
+                    f"assert {fn}(-3) is False, 'got ' + str({fn}(-3))\n"
+                    f"print('OK')\n")})}
 
 
-_TEMPLATES = [_t_constant, _t_operator, _t_offbyone, _t_missing_return, _t_comparison]
+def _t_index(rng):
+    mod = rng.choice(["sequtil", "lists", "arrays", "collections"])
+    fn = rng.choice(["first", "head", "pick", "front"])
+    xs = rng.sample(range(10, 99), 3)
+    ys = rng.sample(range(100, 199), 3)
+    test = f"test_{mod}.py"
+    files = {
+        f"{mod}.py": f"def {fn}(xs):\n    return xs[1]\n",
+        test: (f"from {mod} import {fn}\n"
+               f"assert {fn}({xs}) == {xs[0]}, 'got ' + str({fn}({xs}))\n"
+               f"print('OK')\n"),
+    }
+    fix = {"path": f"{mod}.py", "old_str": "return xs[1]", "new_str": "return xs[0]"}
+    problem = (f"`{fn}` in `{mod}.py` must return the first element of the list, "
+               f"but `python {test}` fails. Fix the index.")
+    return {"files": files, "problem": problem, "check_cmd": f"python {test}",
+            "fix": fix, "test_files": [test],
+            "variant": _variant(f"python test_var_{mod}.py", {
+                f"test_var_{mod}.py": (
+                    f"from {mod} import {fn}\n"
+                    f"assert {fn}({ys}) == {ys[0]}, 'got ' + str({fn}({ys}))\n"
+                    f"print('OK')\n")})}
+
+
+def _t_string(rng):
+    mod = rng.choice(["text", "strutil", "names", "fmt"])
+    fn = rng.choice(["greet", "label", "prefix"])
+    word = rng.choice(["hello", "hi", "hey", "welcome"])
+    bad = word.capitalize()
+    names = rng.sample(["Sam", "Ana", "Leo", "Nia", "Kai", "Uma"], 2)
+    test = f"test_{mod}.py"
+    files = {
+        f"{mod}.py": f'def {fn}(name):\n    return "{bad} " + name\n',
+        test: (f"from {mod} import {fn}\n"
+               f'assert {fn}("{names[0]}") == "{word} {names[0]}", '
+               f"'got ' + {fn}('{names[0]}')\n"
+               f"print('OK')\n"),
+    }
+    fix = {"path": f"{mod}.py", "old_str": f'return "{bad} " + name',
+           "new_str": f'return "{word} " + name'}
+    problem = (f"`{fn}` in `{mod}.py` must mention the caller's name in lower-case "
+               f"(`{word} <name>`), but `python {test}` fails. Fix the string.")
+    return {"files": files, "problem": problem, "check_cmd": f"python {test}",
+            "fix": fix, "test_files": [test],
+            "variant": _variant(f"python test_var_{mod}.py", {
+                f"test_var_{mod}.py": (
+                    f"from {mod} import {fn}\n"
+                    f'assert {fn}("{names[1]}") == "{word} {names[1]}"\n'
+                    f"print('OK')\n")})}
+
+
+def _t_default(rng):
+    mod = rng.choice(["config", "settings", "options", "defaults"])
+    fn = rng.choice(["limit", "retries", "timeout", "batch"])
+    correct = rng.randint(3, 9)
+    wrong = correct + rng.choice([-2, 2])
+    test = f"test_{mod}.py"
+    files = {
+        f"{mod}.py": f"def {fn}(n={wrong}):\n    return n\n",
+        test: (f"from {mod} import {fn}\n"
+               f"assert {fn}() == {correct}, 'got ' + str({fn}())\n"
+               f"print('OK')\n"),
+    }
+    fix = {"path": f"{mod}.py", "old_str": f"def {fn}(n={wrong}):",
+           "new_str": f"def {fn}(n={correct}):"}
+    problem = (f"`{fn}` in `{mod}.py` must default to {correct}, but `python "
+               f"{test}` fails. Fix the default value.")
+    return {"files": files, "problem": problem, "check_cmd": f"python {test}",
+            "fix": fix, "test_files": [test],
+            "variant": _variant(f"python test_var_{mod}.py", {
+                f"test_var_{mod}.py": (
+                    f"from {mod} import {fn}\n"
+                    f"assert {fn}() == {correct}, 'default wrong'\n"
+                    f"assert {fn}(5) == 5, 'explicit arg ignored'\n"
+                    f"print('OK')\n")})}
+
+
+def _t_boolean(rng):
+    mod = rng.choice(["logic", "flags", "rules", "gates"])
+    fn = rng.choice(["either", "any_true", "enabled", "ok"])
+    test = f"test_{mod}.py"
+    files = {
+        f"{mod}.py": f"def {fn}(a, b):\n    return a and b\n",
+        test: (f"from {mod} import {fn}\n"
+               f"assert {fn}(True, False) is True, 'got ' + str({fn}(True, False))\n"
+               f"assert {fn}(False, False) is False, 'got ' + str({fn}(False, False))\n"
+               f"print('OK')\n"),
+    }
+    fix = {"path": f"{mod}.py", "old_str": "return a and b", "new_str": "return a or b"}
+    problem = (f"`{fn}` in `{mod}.py` must be true when *either* argument is true, "
+               f"but `python {test}` fails. Fix the logic.")
+    return {"files": files, "problem": problem, "check_cmd": f"python {test}",
+            "fix": fix, "test_files": [test],
+            "variant": _variant(f"python test_var_{mod}.py", {
+                f"test_var_{mod}.py": (
+                    f"from {mod} import {fn}\n"
+                    f"assert {fn}(False, True) is True, 'got ' + str({fn}(False, True))\n"
+                    f"assert {fn}(True, True) is True\n"
+                    f"print('OK')\n")})}
+
+
+def _t_sort(rng):
+    mod = rng.choice(["order", "rank", "sortutil"])
+    fn = rng.choice(["sorted_asc", "ascending", "in_order"])
+    xs = rng.sample(range(1, 20), 4)
+    ys = rng.sample(range(1, 20), 4)
+    test = f"test_{mod}.py"
+    files = {
+        f"{mod}.py": f"def {fn}(xs):\n    return sorted(xs, reverse=True)\n",
+        test: (f"from {mod} import {fn}\n"
+               f"assert {fn}({xs}) == {sorted(xs)}, 'got ' + str({fn}({xs}))\n"
+               f"print('OK')\n"),
+    }
+    fix = {"path": f"{mod}.py", "old_str": "return sorted(xs, reverse=True)",
+           "new_str": "return sorted(xs, reverse=False)"}
+    problem = (f"`{fn}` in `{mod}.py` must return the list in ascending order, but "
+               f"`python {test}` fails. Fix the sort.")
+    return {"files": files, "problem": problem, "check_cmd": f"python {test}",
+            "fix": fix, "test_files": [test],
+            "variant": _variant(f"python test_var_{mod}.py", {
+                f"test_var_{mod}.py": (
+                    f"from {mod} import {fn}\n"
+                    f"assert {fn}({ys}) == {sorted(ys)}, 'got ' + str({fn}({ys}))\n"
+                    f"print('OK')\n")})}
+
+
+def _t_multifile(rng):
+    """A two-module defect: the fix lives in the helper the API imports. Exercises
+    "the correct file is not the one named in the problem" without a real repo."""
+    helper = rng.choice(["util", "helpers", "support", "internal"])
+    api = rng.choice(["api", "service", "app", "core_lib"])
+    fn = rng.choice(["compute", "process", "transform"])
+    correct = rng.randint(2, 9)
+    wrong = correct + rng.choice([-1, 1])
+    inner = "_scale"
+    test = f"test_{api}.py"
+    files = {
+        f"{helper}.py": f"def {inner}(x):\n    return x * {wrong}\n",
+        f"{api}.py": (f"from {helper} import {inner}\n\n\n"
+                      f"def {fn}(x):\n    return {inner}(x)\n"),
+        test: (f"from {api} import {fn}\n"
+               f"assert {fn}(1) == {correct}, 'got ' + str({fn}(1))\n"
+               f"print('OK')\n"),
+    }
+    fix = {"path": f"{helper}.py", "old_str": f"return x * {wrong}",
+           "new_str": f"return x * {correct}"}
+    problem = (f"`{fn}` in `{api}.py` multiplies its argument by {correct}, but "
+               f"`python {test}` fails and the value comes from a helper module. "
+               f"Find and fix the source of the wrong factor.")
+    return {"files": files, "problem": problem, "check_cmd": f"python {test}",
+            "fix": fix, "test_files": [test],
+            "variant": _variant(f"python test_var_{api}.py", {
+                f"test_var_{api}.py": (
+                    f"from {api} import {fn}\n"
+                    f"assert {fn}(3) == {3 * correct}, 'got ' + str({fn}(3))\n"
+                    f"assert {fn}(0) == 0\n"
+                    f"print('OK')\n")})}
+
+
+_TEMPLATES = [_t_constant, _t_operator, _t_offbyone, _t_missing_return,
+              _t_comparison, _t_index, _t_string, _t_default, _t_boolean,
+              _t_sort, _t_multifile]
+
+# Train and eval use disjoint seed ranges (RL_PLAN_2 §6.1/§9 G4): the generator
+# is parameterised by seed, so a held-out split is a held-out range, and a policy
+# that memorised the training tasks is exposed by the eval range.
+TRAIN_SEED0 = 0
+HOLDOUT_SEED0 = 1_000_000
 
 
 class MicroTask:
-    def __init__(self, task_id, files, problem, check_cmd, fix=None, tier=0):
+    def __init__(self, task_id, files, problem, check_cmd, fix=None, tier=0,
+                 test_files=None, variant=None):
         self.task_id = task_id
         self.files = files
         self.problem = problem
         self.check_cmd = check_cmd
         self.fix = fix          # {"path","old_str","new_str"} — for the oracle, never the prompt
         self.tier = tier
+        # which files are tests: the verifier restores them before grading so the
+        # check can only be passed by a source edit (§4.3)
+        self.test_files = test_files if test_files is not None else [
+            k for k in files if os.path.basename(k).startswith("test_")]
+        # {"files": {rel: text}, "check_cmd": str} — same defect, other literals
+        self.variant = variant
 
     def user_prompt(self, workdir: str) -> str:
         return f"{self.problem}\n\nThe repository is at {workdir}."
@@ -348,15 +632,30 @@ class MicroTask:
 
 def generate_task(seed: int) -> MicroTask:
     rng = random.Random(seed)
-    files, problem, check, fix = rng.choice(_TEMPLATES)(rng)
-    return MicroTask(f"micro-{seed}", files, problem, check, fix=fix)
+    spec = rng.choice(_TEMPLATES)(rng)
+    return MicroTask(f"micro-{seed}", spec["files"], spec["problem"],
+                     spec["check_cmd"], fix=spec["fix"],
+                     test_files=spec.get("test_files"),
+                     variant=spec.get("variant"))
 
 
-def run_check(task: MicroTask, sb: Sandbox) -> dict:
-    """The deterministic correctness oracle: did the repo's own test pass?"""
-    res = sb.bash(task.check_cmd)
+def holdout_tasks(n: int, seed0: int = HOLDOUT_SEED0):
+    """The eval split: same generator, disjoint seed range (§6.1)."""
+    return [generate_task(seed0 + i) for i in range(n)]
+
+
+def run_check(task: MicroTask, sb: Sandbox, cmd: str | None = None) -> dict:
+    """The deterministic correctness oracle: did the repo's own test pass?
+
+    `cmd` overrides the task's check (used by the verifier's held-out variant,
+    §4.3). The pass rule stays `exit_code == 0 and "OK" in stdout` — that rule is
+    spoofable on its own, which is exactly why the verifier restores the test
+    files and re-runs the variant before it believes this.
+    """
+    cmd = cmd or task.check_cmd
+    res = sb.bash(cmd)
     passed = res.get("exit_code") == 0 and "OK" in (res.get("stdout") or "")
-    return {"ran": True, "passed": passed, "cmd": task.check_cmd,
+    return {"ran": True, "passed": passed, "cmd": cmd,
             "output": (res.get("stdout", "") + res.get("stderr", ""))[-800:]}
 
 
@@ -396,17 +695,29 @@ def parse_calls(text: str) -> list[tuple[str, dict]]:
 
 
 def run_episode(task: MicroTask, policy, max_steps: int = MAX_STEPS,
-                keep: bool = False) -> dict:
+                keep: bool = False, grader=None) -> dict:
     """Drive the sandbox against `policy(messages) -> dict`:
         {"text": str, "stopped": bool, "calls": [(name,args)], ...}
-    `calls` may be empty; they are then parsed from `text`."""
+    `calls` may be empty; they are then parsed from `text`.
+
+    `grader(task, sb, episode) -> dict`, if given, runs while the sandbox is open
+    (the verifier needs the tree to restore test files and re-check, §4.3) and its
+    return value lands in the episode as `grade`. The plain `check` is always the
+    as-is run, so a caller that ignores grading keeps the old behaviour.
+
+    `initial_check` is the check on the *pristine* tree, recorded before the
+    policy moves: the graded ladder's "did the failure change" step (§4.2) is a
+    comparison against it.
+    """
     sb = Sandbox(task.files, keep=keep)
     try:
         messages = [{"role": "system", "content": system_prompt(str(sb.workdir))},
                     {"role": "user", "content": task.user_prompt(str(sb.workdir))}]
+        initial = run_check(task, sb)
         steps, calls_made, signatures = 0, [], []
         submitted = False
         last_stopped = True
+        turn_stopped = []      # per assistant turn: did it end on im_end (not num_predict)?
         while steps < max_steps:
             steps += 1
             out = policy(messages)
@@ -414,11 +725,18 @@ def run_episode(task: MicroTask, policy, max_steps: int = MAX_STEPS,
             last_stopped = bool(out.get("stopped", True))
             calls = out.get("calls") or parse_calls(text)
             if not calls:
+                # a turn with prose and no call is still an action the policy
+                # took (it chose to stop). Keep it: GRPO trains on it, and DPO's
+                # turn extraction already handles a call-less assistant turn.
+                if text.strip():
+                    messages.append({"role": "assistant", "content": text})
+                    turn_stopped.append(last_stopped)
                 break
             hist = text.strip() or "\n".join(
                 TOOL_CALL + json.dumps({"name": n, "arguments": a}, ensure_ascii=False)
                 for n, a in calls)
             messages.append({"role": "assistant", "content": hist})
+            turn_stopped.append(last_stopped)
             for name, args in calls:
                 sig = (name, json.dumps(args, sort_keys=True))
                 signatures.append(sig)
@@ -434,14 +752,19 @@ def run_episode(task: MicroTask, policy, max_steps: int = MAX_STEPS,
         err_sigs = [s for s in signatures if signatures.count(s) >= 2]
         loop = len(set(err_sigs)) > 0
         check = run_check(task, sb)
-        return {
+        ep = {
             "task_id": task.task_id, "tier": task.tier, "seed": task.task_id,
             "messages": messages, "steps": steps, "stopped": last_stopped,
             "submitted": submitted, "loop": loop,
             "n_calls": len(calls_made),
             "check": check,
+            "initial_check": initial,
+            "turn_stopped": turn_stopped,
             "workdir": str(sb.workdir),
         }
+        if grader is not None:
+            ep["grade"] = grader(task, sb, ep)
+        return ep
     finally:
         sb.close()
 
@@ -474,14 +797,60 @@ def selftest() -> int:
             fails.append(name)
 
     print("== generator variety (no two seeds share a template+module)")
-    tasks = [generate_task(s) for s in range(40)]
-    ok("variety", len({(t.problem) for t in tasks}) >= 20,
-       f"{len({t.problem for t in tasks})}/40 distinct")
+    tasks = [generate_task(s) for s in range(60)]
+    ok("variety", len({(t.problem) for t in tasks}) >= 40,
+       f"{len({t.problem for t in tasks})}/60 distinct")
+    ok("all_have_variant", all(t.variant and t.variant.get("files") for t in tasks))
+    ok("all_have_tests", all(t.test_files for t in tasks),
+       "every task must declare a test file for the anti-hack restore")
 
     t = generate_task(0)
-    print(f"  task0: {t.task_id} check={t.check_cmd} files={list(t.files)}")
-    files, problem, check, fix = _t_constant(random.Random(0))
-    task = MicroTask("unit", files, problem, check, fix=fix)
+    print(f"  task0: {t.task_id} check={t.check_cmd} files={list(t.files)} "
+          f"tests={t.test_files}")
+    spec = _t_constant(random.Random(0))
+    task = MicroTask("unit", spec["files"], spec["problem"], spec["check_cmd"],
+                     fix=spec["fix"], test_files=spec.get("test_files"),
+                     variant=spec.get("variant"))
+
+    print("== anti-hack snapshot: pristine files are kept, an edit is seen")
+    sb = Sandbox(task.files)
+    try:
+        diff0 = sb.diff_initial()
+        ok("pristine_no_diff", diff0 == {}, str(diff0))
+        p = task.fix["path"]
+        sb.str_replace(p, task.fix["old_str"], task.fix["new_str"])
+        diff1 = sb.diff_initial()
+        ok("edit_seen", list(diff1) == [p], str(list(diff1)))
+        vb = task.variant["files"]
+        sb.restore(vb)
+        ok("variant_written", all((sb.workdir / r).exists() for r in vb))
+    finally:
+        sb.close()
+
+    print("== variant separates a real fix from a hard-coded constant")
+    src = task.files[task.fix["path"]]
+    fn = re.match(r"def (\w+)", src).group(1)
+    correct = task.fix["new_str"].split("+")[1].strip()
+    sb = Sandbox(task.files)
+    try:
+        # the honest fix passes both the visible check and the held-out variant
+        sb.str_replace(task.fix["path"], task.fix["old_str"], task.fix["new_str"])
+        ok("fix_visible", run_check(task, sb)["passed"] is True)
+        sb.restore(task.variant["files"])
+        ok("fix_variant", run_check(task, sb, task.variant["check_cmd"])["passed"]
+           is True)
+    finally:
+        sb.close()
+    sb = Sandbox(task.files)
+    try:
+        # hard-code the visible test's expected output: visible passes, variant fails
+        sb.restore({task.fix["path"]: f"def {fn}(x):\n    return {correct}\n"})
+        ok("hardcode_visible", run_check(task, sb)["passed"] is True)
+        sb.restore(task.variant["files"])
+        ok("hardcode_variant_fails",
+           run_check(task, sb, task.variant["check_cmd"])["passed"] is False)
+    finally:
+        sb.close()
 
     print("== do-nothing control: submit immediately must NOT pass")
     ep = run_episode(task, _script([{"text": "I don't know.", "stopped": True,
