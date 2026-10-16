@@ -197,6 +197,7 @@ def main():
     ce_chunk = int(env("CE_CHUNK", 2048))
     replay_frac = float(env("REPLAY_FRAC", 0.1))
     ckpt_every = int(env("CKPT_EVERY", 100))
+    report_every = int(env("REPORT_EVERY", 1))
     max_hours = float(env("MAX_HOURS", 11.0))
     max_steps = int(env("MAX_STEPS", 0))
     seed = int(env("SEED", 1234))
@@ -377,7 +378,8 @@ def main():
             met = {k: v / max(1, n_micro) for k, v in agg.items()}
             met["step"] = step
             hist.append(met)
-            if main_proc and (step % 10 == 0 or step == 1 or step == total_steps):
+            if main_proc and (step % report_every == 0 or step == 1
+                              or step == total_steps):
                 el = time.time() - t0
                 print(f"[{step}/{total_steps}] loss {met.get('loss',0):+.4f} "
                       f"pg {met.get('pg',0):+.4f} kl {met.get('kl',0):.4f} "
