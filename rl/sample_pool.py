@@ -102,6 +102,7 @@ def rows_from_episode(ep, task_group_id, reward, advantage, meta):
             "reward": reward,
             "advantage": advantage,
             "submitted": bool(ep.get("submitted")),
+            "verified": bool(meta["verified"]),
             "group_mean": meta["group_mean"],
             "group_std": meta["group_std"],
             "group_size": meta["group_size"],
@@ -129,11 +130,13 @@ def sample_task(task, policy_of_group, group, keep=False):
         "anti_hack": sorted({a for ep in eps for a in ep["grade"]["anti_hack"]}),
         "pass_rate": round(sum(1 for r in rewards if r == 1.0) / group, 3),
         "submit_rate": round(sum(1 for ep in eps if ep["submitted"]) / group, 3),
+        "verify_rate": round(sum(1 for ep in eps if ep["grade"]["verified"]) / group, 3),
     }
     for g, ep in enumerate(eps):
         meta = {"group_index": g, "group_mean": mean, "group_std": std,
                 "group_size": group, "degenerate": degenerate,
-                "tier": ep["grade"]["tier"], "anti_hack": ep["grade"]["anti_hack"]}
+                "tier": ep["grade"]["tier"], "anti_hack": ep["grade"]["anti_hack"],
+                "verified": ep["grade"]["verified"]}
         rows.extend(rows_from_episode(ep, task.task_id, rewards[g], advantages[g],
                                       meta))
     return rows, summary
@@ -226,7 +229,7 @@ def main() -> int:
             fh.flush()
             print(f"  {task.task_id:<16} rewards={summary['rewards']} "
                   f"std={summary['std']:.3f} pass={summary['pass_rate']} "
-                  f"sub={summary['submit_rate']} "
+                  f"sub={summary['submit_rate']} vfy={summary['verify_rate']} "
                   f"tiers={sorted(set(summary['tiers']))} "
                   f"{'DROP' if summary['degenerate'] else ''}", flush=True)
             if a.target_groups and good >= a.target_groups:
@@ -272,7 +275,8 @@ def selftest() -> int:
     p = rows[0]
     ok("row_keys", set(p) >= {"group_id", "episode_id", "task_id", "turn_index",
                               "prompt_msgs", "completion", "reward", "advantage",
-                              "group_mean", "group_std", "degenerate", "logpi_ref"})
+                              "submitted", "verified", "group_mean", "group_std",
+                              "degenerate", "logpi_ref"})
     ok("completion_header", p["completion"].startswith(HEADER))
     ok("prompt_is_prefix", all(m["role"] != "assistant" for m in p["prompt_msgs"]))
     advs = {r["episode_id"]: r["advantage"] for r in rows}

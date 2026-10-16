@@ -71,6 +71,7 @@ def report_samples(paths) -> int:
     means = [r.get("group_mean", 0.0) for r in groups.values()]
     pass_eps = [e for e, r in episodes.items() if r.get("reward") == 1.0]
     sub_eps = [e for e, r in episodes.items() if r.get("submitted")]
+    ver_eps = [e for e, r in episodes.items() if r.get("verified")]
     tiers = Counter(r.get("tier", "?") for r in episodes.values())
     anti = Counter(a for r in episodes.values() for a in (r.get("anti_hack") or []))
     rewards = Counter(round(r.get("reward", -1), 3) for r in episodes.values())
@@ -110,6 +111,8 @@ def report_samples(paths) -> int:
     print(f"reward (eps)   : {dict(sorted(rewards.items()))}")
     print(f"submit rate    : {len(sub_eps)/max(1,n_eps):.1%} of episodes ended on "
           f"submit (§4.2b — was the termination reward alive?)")
+    print(f"verify rate    : {len(ver_eps)/max(1,n_eps):.1%} of episodes re-ran the "
+          f"check after their last edit (§4.2b — submit *and* verify bank the reward)")
     print(f"anti-hack (eps): {dict(anti) or '{}'}")
     print(f"turns/row group: {dict(sorted(turns.items()))}")
     if actions:

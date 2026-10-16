@@ -12,13 +12,16 @@ raw check cannot:
      read-before-edit respected) so the group has spread. Weights are the plan's
      starting point and are meant to be retuned from the G0 measurement.
 
-  1b. **`submit` banks the reward (§4.2b).** The ladder says how good the final
-     file state is; `submit` is what cashes it in. An episode that never terminated
-     scores 0.0 however good its state — in deployment an unsubmitted episode is a
-     timeout, i.e. no answer. This is what stops "keep working forever" from being
-     weakly optimal, which is the reason GRPO trained termination away: reward was
-     the file state, so one more step was free upside. The do-nothing control is
-     untouched — an immediate submit is rung `none` and banks 0.0 (§4.5).
+  1b. **`submit` after a check banks the reward (§4.2b).** The ladder says how good
+     the final file state is; `submit` cashes it in, and only once the failing check
+     has been re-run on that state. Round 1 lost termination (71.5% -> 0%) because
+     the reward was the file state — one more step was free upside. Round 2's soft
+     bonus barely moved it (0% -> 2.5%). Round 3 hard-gated on `submit`: terminate
+     0% -> 27%, but *hollowly* — 51 of 54 submits were failures and `verify_with_check`
+     collapsed 0.87 -> 0.05, because re-running the test costs a step and earns
+     nothing, so the policy learned to edit and declare. So a submit only banks when
+     the check was re-run after the last edit. The do-nothing control is untouched —
+     an immediate submit is rung `none` and banks 0.0 (§4.5).
 
   2. **Anti-hack (§4.3).** The shaping terms are a hack surface, so grading is
      hostile to the three cheap hacks:
@@ -61,14 +64,18 @@ R_PROGRESS = 0.6
 R_CORRECT_FILE = 0.4
 R_EDITED = 0.2
 R_NONE = 0.0
-# §4.2b — `submit` banks the reward (hard gate; see `grade`). An episode that never
-# terminated scores R_NONE whatever its rung. GRPO round 1 lost termination outright
-# (terminate 71.5% -> 0%) because the reward was the file state, so one more step was
-# free upside. Round 2 tried the softer form — a +0.2 bonus on top of the rung — and
-# it did *not* work either (terminate 0% -> 2.5%): 86% of the base policy's submits
-# are rung `none`, so the bonus almost never landed on the trajectories that decide
-# behaviour, and gating on the rung still let the model bank `progress` without ever
-# terminating. Hard-gating removes that free upside. (`R_SUBMIT` retired.)
+# §4.2b — `submit` *after re-running the check* banks the reward (hard gate; see
+# `grade`). An episode that never terminated, or that terminated without re-running
+# the failing check on its final state, scores R_NONE whatever its rung. The history
+# is the reason both conditions are required:
+#   round 1  reward = file state            -> terminate 71.5% -> 0%   (free upside)
+#   round 2  + a +0.2 rung-gated bonus      -> terminate 0% -> 2.5%    (too weak)
+#   round 3  hard gate on `submit`          -> terminate 0% -> 27%, but hollow:
+#            51/54 submits were failures, verify_with_check 0.87 -> 0.05
+# Round 3 shows why `submit` alone is not enough: re-running the test costs a step and
+# earns nothing, so a policy paid only for terminating learns to edit and declare. The
+# check is therefore part of what banks the reward. (§4.5 holds: a do-nothing immediate
+# submit has no edit, hence no check-after-edit, hence 0.0.) (`R_SUBMIT` retired.)
 
 # a *source* edit that only makes the check short-circuit. The check is
 # `exit_code == 0 and "OK" in stdout`; these are the two ways to satisfy it
@@ -113,6 +120,33 @@ def _read_before_edit(messages) -> bool:
     if not mutated:
         return False
     return all(p in viewed for p in mutated if p)
+
+
+def _ran_check_after_last_edit(messages, check_cmd) -> bool:
+    """Did the episode re-run the failing check after its last edit?
+
+    This is exactly `agent_rollout`'s `verify_with_check`, computed the same way, so
+    the reward and the G4 metric measure one thing. `submit` is only banked when this
+    holds: an answer declared without re-running the check on it is the round-3
+    failure (51/54 submits were never-re-tested).
+    """
+    cmd = (check_cmd or "").strip()
+    if not cmd:
+        return False
+    calls = []
+    for m in messages or []:
+        if m.get("role") != "assistant":
+            continue
+        calls.extend(parse_calls(m.get("content") or ""))
+    last_edit = -1
+    for i, (name, args) in enumerate(calls):
+        if name == "str_replace_editor" and args.get("command") in (
+                "create", "str_replace", "insert"):
+            last_edit = i
+    if last_edit < 0:
+        return False
+    return any(name == "bash" and str(args.get("command", "")).strip() == cmd
+               for name, args in calls[last_edit + 1:])
 
 
 def _changed_among(changed, files) -> dict:
@@ -162,8 +196,10 @@ def grade(task, sb, episode) -> dict:
     progressed = (visible["output"] != initial.get("output", "")) and not visible["passed"]
     correct_file = bool(task.fix) and task.fix["path"] in source_changed
     edited = bool(source_changed)
-    rbe = _read_before_edit((episode or {}).get("messages"))
+    msgs = (episode or {}).get("messages")
+    rbe = _read_before_edit(msgs)
     submitted = bool((episode or {}).get("submitted"))
+    verified = _ran_check_after_last_edit(msgs, visible.get("cmd"))
 
     if anti:
         ladder, tier = R_NONE, "anti_hack"
@@ -178,18 +214,20 @@ def grade(task, sb, episode) -> dict:
     else:
         ladder, tier = R_NONE, "none"
 
-    # §4.2b hard gate: `ladder` is what the final file state is worth, `submit` is
-    # what banks it. No submit -> no bank, whatever the rung. That kills the free
-    # upside of "just do one more step" that made round 1 (and round 2's softer
-    # bonus) fail. §4.5 still holds: an immediate/do-nothing submit is rung `none`,
-    # so it banks 0.0. Anti-hack also stays 0.0 (it never reaches the ladder).
-    reward = ladder if submitted else R_NONE
+    # §4.2b hard gate: `ladder` is what the final file state is worth; `submit` banks
+    # it, and only after the check was re-run on that state. No submit -> no bank
+    # (round 3: terminating without working is hollow). Submit but no check -> no bank
+    # (round 3: 51/54 submits were failures it never re-tested). §4.5 still holds: a
+    # do-nothing immediate submit has no edit, so no check-after-edit, so 0.0.
+    # Anti-hack stays 0.0 too (it never reaches the ladder).
+    reward = ladder if (submitted and verified) else R_NONE
 
     return {
         "reward": reward,
         "tier": tier,
         "ladder": ladder,
         "submitted": submitted,
+        "verified": bool(verified),
         "anti_hack": anti,
         "check": visible,
         "variant": variant,
@@ -295,20 +333,34 @@ def selftest() -> int:
     ok("sysexit_reward", g["reward"] == 0.0, str(g))
     ok("sysexit_anti", "shortcut_marker" in g["anti_hack"], str(g["anti_hack"]))
 
-    print("== §4.2b gate: a wrong-but-changed edit that NEVER submits scores 0.0 "
-          "(the rung is recorded but not banked)")
-    def progress_policy(messages):
-        if not progress_policy.done:
-            progress_policy.done = True
-            return {"text": tc + json.dumps({"name": "str_replace_editor", "arguments": {
-                "command": "view", "path": path}}), "stopped": True, "calls": []}
+    def _wrong_edit():
         # change the constant to a *different* wrong value: check still fails, but
-        # the failure output changed, which would be the 0.6 rung
+        # the failure output changed, which is the 0.6 rung
         wrong = task.fix["old_str"].split("+")[1].strip()
         return {"text": tc + json.dumps({"name": "str_replace_editor", "arguments": {
             "command": "str_replace", "path": path,
             "old_str": src.splitlines()[1].strip(),
             "new_str": f"return x + {int(wrong) + 1000}"}}), "stopped": True, "calls": []}
+
+    def _view():
+        return {"text": tc + json.dumps({"name": "str_replace_editor", "arguments": {
+            "command": "view", "path": path}}), "stopped": True, "calls": []}
+
+    def _bash(command):
+        return {"text": tc + json.dumps({"name": "bash", "arguments": {
+            "command": command}}), "stopped": True, "calls": []}
+
+    def _submit():
+        return {"text": tc + json.dumps({"name": "submit", "arguments": {}}),
+                "stopped": True, "calls": []}
+
+    print("== §4.2b gate: a wrong-but-changed edit that never submits scores 0.0 "
+          "(the rung is recorded but not banked)")
+    def progress_policy(messages):
+        if not progress_policy.done:
+            progress_policy.done = True
+            return _view()
+        return _wrong_edit()
     progress_policy.done = False
     ep_progress = grade_run(progress_policy)
     ok("progress_rung_recorded", ep_progress["grade"]["ladder"] == 0.6,
@@ -316,29 +368,41 @@ def selftest() -> int:
     ok("progress_no_submit_banks_zero", ep_progress["grade"]["reward"] == 0.0,
        "no submit -> nothing banked, however good the rung")
 
-    print("== §4.2b gate: the *same* progress, but it submits -> 0.6 banked")
-    def progress_submit_policy(messages):
-        n = progress_submit_policy.n
-        progress_submit_policy.n += 1
+    print("== §4.2b gate: progress, check re-run, then submit -> 0.6 banked")
+    def progress_ok(messages):
+        n = progress_ok.n
+        progress_ok.n += 1
         if n == 0:
-            return {"text": tc + json.dumps({"name": "str_replace_editor", "arguments": {
-                "command": "view", "path": path}}), "stopped": True, "calls": []}
+            return _view()
         if n == 1:
-            wrong = task.fix["old_str"].split("+")[1].strip()
-            return {"text": tc + json.dumps({"name": "str_replace_editor", "arguments": {
-                "command": "str_replace", "path": path,
-                "old_str": src.splitlines()[1].strip(),
-                "new_str": f"return x + {int(wrong) + 1000}"}}), "stopped": True, "calls": []}
-        return {"text": tc + json.dumps({"name": "submit", "arguments": {}}),
-                "stopped": True, "calls": []}
-    progress_submit_policy.n = 0
-    ep_psub = grade_run(progress_submit_policy)
-    gsub = ep_psub["grade"]
-    ok("submit_episode_submitted", ep_psub["submitted"] is True)
-    ok("submit_banks_rung", gsub["reward"] == 0.6 and gsub["ladder"] == 0.6, str(gsub))
-    ok("submit_outscores_nosubmit",
-       gsub["reward"] > ep_progress["grade"]["reward"],
-       f"{gsub['reward']} vs {ep_progress['grade']['reward']}")
+            return _wrong_edit()
+        if n == 2:
+            return _bash(task.check_cmd)
+        return _submit()
+    progress_ok.n = 0
+    gok = grade_run(progress_ok)["grade"]
+    ok("submit_after_check_verified",
+       gok["verified"] is True and gok["submitted"] is True, str(gok))
+    ok("submit_after_check_banks_rung",
+       gok["reward"] == 0.6 and gok["ladder"] == 0.6, str(gok))
+    ok("bank_beats_no_submit", gok["reward"] > ep_progress["grade"]["reward"],
+       f"{gok['reward']} vs {ep_progress['grade']['reward']}")
+
+    print("== §4.2b gate: progress + submit but NEVER re-running the check -> 0.0 "
+          "(round 3 banked 51/54 submits it never re-tested)")
+    def progress_noverify(messages):
+        n = progress_noverify.n
+        progress_noverify.n += 1
+        if n == 0:
+            return _view()
+        if n == 1:
+            return _wrong_edit()
+        return _submit()
+    progress_noverify.n = 0
+    gnv = grade_run(progress_noverify)["grade"]
+    ok("submit_without_check_not_verified", gnv["verified"] is False, str(gnv))
+    ok("submit_without_check_banks_zero",
+       gnv["reward"] == 0.0 and gnv["ladder"] == 0.6, str(gnv))
 
     print("== §4.2b gate: a *passing* fix that never submits still scores 0.0 "
           "(an unsubmitted episode is a timeout, not a win)")
@@ -346,8 +410,7 @@ def selftest() -> int:
         n = fix_no_submit_policy.n
         fix_no_submit_policy.n += 1
         if n == 0:
-            return {"text": tc + json.dumps({"name": "str_replace_editor", "arguments": {
-                "command": "view", "path": path}}), "stopped": True, "calls": []}
+            return _view()
         if n == 1:
             return {"text": tc + json.dumps({"name": "str_replace_editor", "arguments": {
                 "command": "str_replace", "path": path,
