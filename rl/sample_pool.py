@@ -101,6 +101,7 @@ def rows_from_episode(ep, task_group_id, reward, advantage, meta):
             "completion_stopped": stopped,
             "reward": reward,
             "advantage": advantage,
+            "submitted": bool(ep.get("submitted")),
             "group_mean": meta["group_mean"],
             "group_std": meta["group_std"],
             "group_size": meta["group_size"],
@@ -127,6 +128,7 @@ def sample_task(task, policy_of_group, group, keep=False):
         "tiers": [ep["grade"]["tier"] for ep in eps],
         "anti_hack": sorted({a for ep in eps for a in ep["grade"]["anti_hack"]}),
         "pass_rate": round(sum(1 for r in rewards if r == 1.0) / group, 3),
+        "submit_rate": round(sum(1 for ep in eps if ep["submitted"]) / group, 3),
     }
     for g, ep in enumerate(eps):
         meta = {"group_index": g, "group_mean": mean, "group_std": std,
@@ -224,6 +226,7 @@ def main() -> int:
             fh.flush()
             print(f"  {task.task_id:<16} rewards={summary['rewards']} "
                   f"std={summary['std']:.3f} pass={summary['pass_rate']} "
+                  f"sub={summary['submit_rate']} "
                   f"tiers={sorted(set(summary['tiers']))} "
                   f"{'DROP' if summary['degenerate'] else ''}", flush=True)
             if a.target_groups and good >= a.target_groups:

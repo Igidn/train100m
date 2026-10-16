@@ -12,6 +12,12 @@ raw check cannot:
      read-before-edit respected) so the group has spread. Weights are the plan's
      starting point and are meant to be retuned from the G0 measurement.
 
+  1b. **Termination bonus (§4.2b).** The ladder paid for work but never for
+     `submit`, and stopping later is worth more rungs — so GRPO round 1 learned to
+     never submit (G4: terminate 71.5% -> 0%). A submitted episode that earned a
+     nonzero rung now gets `+R_SUBMIT` (capped at `R_PASS`); the do-nothing control
+     still scores 0.0, because the bonus is gated on the rung.
+
   2. **Anti-hack (§4.3).** The shaping terms are a hack surface, so grading is
      hostile to the three cheap hacks:
        - *restore the test files* from the pristine snapshot and grade the
@@ -53,6 +59,16 @@ R_PROGRESS = 0.6
 R_CORRECT_FILE = 0.4
 R_EDITED = 0.2
 R_NONE = 0.0
+# §4.2b — termination bonus. `submit` is an explicit action the policy *can* take and
+# Stage-A *did* take (58% before the §4.4 prompt, 71.5% under it), but the ladder
+# never rewarded it, while *not* submitting buys more steps and so more chances to
+# climb a rung. GRPO round 1 optimised that: terminate 71.5% -> 0% (G4). This bonus
+# pays for terminating, but only on top of a *nonzero* rung — gated so the §4.5
+# do-nothing control (immediate `submit`) still scores 0.0, which is the whole point
+# of that control. The total is capped at R_PASS so `pass` stays the unique top and
+# every existing `reward == 1.0` check (grpo_report, pass_rate) still means "passed".
+# Weight is a starting point like the rest of the ladder (§14) — tune from G0.
+R_SUBMIT = 0.2
 
 # a *source* edit that only makes the check short-circuit. The check is
 # `exit_code == 0 and "OK" in stdout`; these are the two ways to satisfy it
@@ -147,6 +163,7 @@ def grade(task, sb, episode) -> dict:
     correct_file = bool(task.fix) and task.fix["path"] in source_changed
     edited = bool(source_changed)
     rbe = _read_before_edit((episode or {}).get("messages"))
+    submitted = bool((episode or {}).get("submitted"))
 
     if anti:
         reward, tier = R_NONE, "anti_hack"
@@ -161,9 +178,17 @@ def grade(task, sb, episode) -> dict:
     else:
         reward, tier = R_NONE, "none"
 
+    # §4.2b: pay for terminating, but only on top of real work (a nonzero rung), and
+    # never above `pass`. An immediate/do-nothing submit has rung `none` (0.0) and so
+    # still scores 0.0 (§4.5).
+    submit_bonus = R_SUBMIT if (submitted and reward > R_NONE) else 0.0
+    reward = min(R_PASS, reward + submit_bonus)
+
     return {
         "reward": reward,
         "tier": tier,
+        "submitted": submitted,
+        "submit_bonus": submit_bonus,
         "anti_hack": anti,
         "check": visible,
         "variant": variant,
@@ -205,6 +230,8 @@ def selftest() -> int:
     ep = grade_run(oracle_policy(task))
     g = ep["grade"]
     ok("oracle_reward", g["reward"] == 1.0, str(g))
+    ok("oracle_submitted", ep["submitted"] is True,
+       "the oracle submits; §4.2b caps it back to 1.0 rather than 1.2")
     ok("oracle_variant", g["variant"] and g["variant"]["passed"] is True)
     ok("oracle_no_anti", g["anti_hack"] == [])
 
@@ -281,8 +308,34 @@ def selftest() -> int:
             "old_str": src.splitlines()[1].strip(),
             "new_str": f"return x + {int(wrong) + 1000}"}}), "stopped": True, "calls": []}
     progress_policy.done = False
-    ep = grade_run(progress_policy)
-    ok("progress_reward", ep["grade"]["reward"] == 0.6, str(ep["grade"]))
+    ep_progress = grade_run(progress_policy)
+    ok("progress_reward", ep_progress["grade"]["reward"] == 0.6, str(ep_progress["grade"]))
+
+    print("== §4.2b: the *same* progress, but it submits, scores higher; and pass "
+          "still caps at 1.0")
+    def progress_submit_policy(messages):
+        n = progress_submit_policy.n
+        progress_submit_policy.n += 1
+        if n == 0:
+            return {"text": tc + json.dumps({"name": "str_replace_editor", "arguments": {
+                "command": "view", "path": path}}), "stopped": True, "calls": []}
+        if n == 1:
+            wrong = task.fix["old_str"].split("+")[1].strip()
+            return {"text": tc + json.dumps({"name": "str_replace_editor", "arguments": {
+                "command": "str_replace", "path": path,
+                "old_str": src.splitlines()[1].strip(),
+                "new_str": f"return x + {int(wrong) + 1000}"}}), "stopped": True, "calls": []}
+        return {"text": tc + json.dumps({"name": "submit", "arguments": {}}),
+                "stopped": True, "calls": []}
+    progress_submit_policy.n = 0
+    ep_psub = grade_run(progress_submit_policy)
+    gsub = ep_psub["grade"]
+    ok("submit_episode_submitted", ep_psub["submitted"] is True)
+    ok("submit_bonus_applied", gsub["reward"] == 0.8 and gsub["submit_bonus"] == 0.2,
+       str(gsub))
+    ok("submit_outscores_nosubmit",
+       gsub["reward"] > ep_progress["grade"]["reward"],
+       f"{gsub['reward']} vs {ep_progress['grade']['reward']}")
 
     print()
     if fails:
