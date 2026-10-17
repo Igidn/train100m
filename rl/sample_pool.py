@@ -128,7 +128,8 @@ def sample_task(task, policy_of_group, group, keep=False):
         "std": round(std, 4), "degenerate": degenerate,
         "tiers": [ep["grade"]["tier"] for ep in eps],
         "anti_hack": sorted({a for ep in eps for a in ep["grade"]["anti_hack"]}),
-        "pass_rate": round(sum(1 for r in rewards if r == 1.0) / group, 3),
+        "pass_rate": round(sum(1 for ep in eps if ep["grade"]["tier"] == "pass")
+                           / group, 3),
         "submit_rate": round(sum(1 for ep in eps if ep["submitted"]) / group, 3),
         "verify_rate": round(sum(1 for ep in eps if ep["grade"]["verified"]) / group, 3),
     }
@@ -289,7 +290,8 @@ def selftest() -> int:
 
     print("== an all-oracle pool is degenerate (the trainer would drop it)")
     rows2, summary2 = sample_task(tasks[1], make_policy("oracle", None), 3)
-    ok("oracle_all_pass", summary2["rewards"] == [1.0, 1.0, 1.0])
+    # §4.2b round 5: an oracle episode is pass(1.0) + terminate(0.4) + check(0.1)
+    ok("oracle_all_pass", [round(r, 6) for r in summary2["rewards"]] == [1.5, 1.5, 1.5])
     ok("oracle_degenerate", summary2["degenerate"] is True)
     ok("oracle_rows_flagged",
        all(r["degenerate"] for r in rows2), "rows must carry the flag too")

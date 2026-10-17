@@ -69,7 +69,9 @@ def report_samples(paths) -> int:
     degen = [g for g, r in groups.items() if r.get("degenerate")]
     spreads = [r.get("group_std", 0.0) for r in groups.values()]
     means = [r.get("group_mean", 0.0) for r in groups.values()]
-    pass_eps = [e for e, r in episodes.items() if r.get("reward") == 1.0]
+    # the rung, not the reward value: the reward is additive now (§4.2b round 5),
+    # so a pass that forgot to submit is 1.0 and one that also submitted is 1.5.
+    pass_eps = [e for e, r in episodes.items() if r.get("tier") == "pass"]
     sub_eps = [e for e, r in episodes.items() if r.get("submitted")]
     ver_eps = [e for e, r in episodes.items() if r.get("verified")]
     tiers = Counter(r.get("tier", "?") for r in episodes.values())
@@ -112,7 +114,7 @@ def report_samples(paths) -> int:
     print(f"submit rate    : {len(sub_eps)/max(1,n_eps):.1%} of episodes ended on "
           f"submit (§4.2b — was the termination reward alive?)")
     print(f"verify rate    : {len(ver_eps)/max(1,n_eps):.1%} of episodes re-ran the "
-          f"check after their last edit (§4.2b — submit *and* verify bank the reward)")
+          f"check after their last edit (§4.2b — pays R_CHECK={0.1} on its own now)")
     print(f"anti-hack (eps): {dict(anti) or '{}'}")
     print(f"turns/row group: {dict(sorted(turns.items()))}")
     if actions:

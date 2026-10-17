@@ -12,16 +12,14 @@ raw check cannot:
      read-before-edit respected) so the group has spread. Weights are the plan's
      starting point and are meant to be retuned from the G0 measurement.
 
-  1b. **`submit` after a check banks the reward (§4.2b).** The ladder says how good
-     the final file state is; `submit` cashes it in, and only once the failing check
-     has been re-run on that state. Round 1 lost termination (71.5% -> 0%) because
-     the reward was the file state — one more step was free upside. Round 2's soft
-     bonus barely moved it (0% -> 2.5%). Round 3 hard-gated on `submit`: terminate
-     0% -> 27%, but *hollowly* — 51 of 54 submits were failures and `verify_with_check`
-     collapsed 0.87 -> 0.05, because re-running the test costs a step and earns
-     nothing, so the policy learned to edit and declare. So a submit only banks when
-     the check was re-run after the last edit. The do-nothing control is untouched —
-     an immediate submit is rung `none` and banks 0.0 (§4.5).
+  1b. **`submit` and the check are additive bonuses, not a gate (§4.2b).** The
+     ladder says how good the final file state is; `submit` pays a flat bonus and a
+     re-run of the task's own check pays a small one. Rounds 1–4 gated these (see the
+     block comment by `R_TERM`): every gate made the policy keep one skill and drop
+     the other, and round 4 reached its best headline while scoring 0.0 on its own
+     reward. Decoupling lets both live. The do-nothing control is untouched — an
+     immediate submit is rung `none`, pays no termination bonus, and scores 0.0
+     (§4.5).
 
   2. **Anti-hack (§4.3).** The shaping terms are a hack surface, so grading is
      hostile to the three cheap hacks:
@@ -58,24 +56,33 @@ try:
 except ImportError:  # python rl/verifier.py
     from agent_env import generate_task, parse_calls, run_check, run_episode
 
-# the ladder (§4.2) — one place, so grpo_report and the trainer read the same cut
+# the ladder (§4.2) — one place, so grpo_report and the trainer read the same cut.
+# Round 5 de-farmed it: `progress` (an edit that *moved* the check output but still
+# failed) paid 0.6 and was the cheapest rung to reach, so "one plausible edit and
+# leave" was the optimum and the pass rate never moved. It pays 0.2 now — small next
+# to a pass (1.0) — but keeps the top partial rung, because a change that moves the
+# check is more than a no-op on the right file (`correct_file`, 0.1).
 R_PASS = 1.0
-R_PROGRESS = 0.6
-R_CORRECT_FILE = 0.4
-R_EDITED = 0.2
+R_PROGRESS = 0.2
+R_CORRECT_FILE = 0.1
+R_EDITED = 0.05
 R_NONE = 0.0
-# §4.2b — `submit` *after re-running the check* banks the reward (hard gate; see
-# `grade`). An episode that never terminated, or that terminated without re-running
-# the failing check on its final state, scores R_NONE whatever its rung. The history
-# is the reason both conditions are required:
-#   round 1  reward = file state            -> terminate 71.5% -> 0%   (free upside)
-#   round 2  + a +0.2 rung-gated bonus      -> terminate 0% -> 2.5%    (too weak)
-#   round 3  hard gate on `submit`          -> terminate 0% -> 27%, but hollow:
-#            51/54 submits were failures, verify_with_check 0.87 -> 0.05
-# Round 3 shows why `submit` alone is not enough: re-running the test costs a step and
-# earns nothing, so a policy paid only for terminating learns to edit and declare. The
-# check is therefore part of what banks the reward. (§4.5 holds: a do-nothing immediate
-# submit has no edit, hence no check-after-edit, hence 0.0.) (`R_SUBMIT` retired.)
+# §4.2b (round 5) — the reward is ADDITIVE, not a gate. Rounds 1–4 proved that a
+# gate between two independent skills makes the policy keep only one of them:
+#   round 1  reward = file state            -> verify 0.79, terminate 0.00
+#   round 2  + a +0.2 rung-gated bonus      -> verify 0.87, terminate 0.03  (too weak)
+#   round 3  hard gate on `submit`          -> terminate 0.27, verify 0.05
+#   round 4  hard gate on `submit ∧ verify` -> terminate 0.80, verify 0.00
+# Round 4 is the tell: it hit the best headline yet while scoring 0.0 on its own
+# reward — the gate had made the reward unreachable, so GRPO optimized a proxy.
+# Solving (`ladder`) and terminating (`submit`) are decoupled additive terms now, so
+# the policy cannot trade one for the other. `submit` pays a flat R_TERM, but only
+# when the rung is non-zero, so the §4.5 do-nothing submit stays 0.0. A re-run of the
+# task's own check pays a small dense R_CHECK: as a *gate* the verbatim, task-specific
+# check was an all-or-nothing zero the on-policy gradient could not hold; as a bonus
+# it is a gradient the policy can climb every time it emits it.
+R_TERM = 0.4
+R_CHECK = 0.1
 
 # a *source* edit that only makes the check short-circuit. The check is
 # `exit_code == 0 and "OK" in stdout`; these are the two ways to satisfy it
@@ -214,13 +221,21 @@ def grade(task, sb, episode) -> dict:
     else:
         ladder, tier = R_NONE, "none"
 
-    # §4.2b hard gate: `ladder` is what the final file state is worth; `submit` banks
-    # it, and only after the check was re-run on that state. No submit -> no bank
-    # (round 3: terminating without working is hollow). Submit but no check -> no bank
-    # (round 3: 51/54 submits were failures it never re-tested). §4.5 still holds: a
-    # do-nothing immediate submit has no edit, so no check-after-edit, so 0.0.
-    # Anti-hack stays 0.0 too (it never reaches the ladder).
-    reward = ladder if (submitted and verified) else R_NONE
+    # §4.2b (round 5) — additive and decoupled. `ladder` is what the final file state
+    # is worth; a clean termination pays a flat bonus (only off a non-zero rung) and
+    # re-running the task's own check pays a small one. None zeroes the others, so the
+    # policy can hold "solve" and "terminate" at once (rounds 1–4 each dropped one).
+    # §4.5 holds: a do-nothing immediate submit has no edit, so `ladder` is 0 and the
+    # termination bonus does not fire. Anti-hack stays 0.0 flat (it never reaches the
+    # ladder).
+    if anti:
+        reward = R_NONE
+    else:
+        reward = ladder
+        if submitted and ladder > 0:
+            reward += R_TERM
+        if verified:
+            reward += R_CHECK
 
     return {
         "reward": reward,
@@ -265,12 +280,15 @@ def selftest() -> int:
     def grade_run(policy):
         return run_episode(task, policy, grader=grade)
 
-    print("== oracle (honest fix) -> 1.0")
+    print("== oracle (honest fix, check, submit) -> 1.0 + 0.4 + 0.1 = 1.5")
     ep = grade_run(oracle_policy(task))
     g = ep["grade"]
-    ok("oracle_reward", g["reward"] == 1.0, str(g))
+    oracle_reward = g["reward"]
+    ok("oracle_reward", g["reward"] == 1.5, str(g))
     ok("oracle_submitted", ep["submitted"] is True,
-       "the oracle banks its pass by submitting (§4.2b)")
+       "the oracle earns the §4.2b termination bonus")
+    ok("oracle_verified", g["verified"] is True,
+       "the oracle earns the §4.2b check bonus")
     ok("oracle_variant", g["variant"] and g["variant"]["passed"] is True)
     ok("oracle_no_anti", g["anti_hack"] == [])
 
@@ -354,8 +372,8 @@ def selftest() -> int:
         return {"text": tc + json.dumps({"name": "submit", "arguments": {}}),
                 "stopped": True, "calls": []}
 
-    print("== §4.2b gate: a wrong-but-changed edit that never submits scores 0.0 "
-          "(the rung is recorded but not banked)")
+    print("== §4.2b (round 5, additive): a wrong-but-changed edit alone = its rung "
+          "(0.2 — no submit, no check, and none of the three zeroes the others)")
     def progress_policy(messages):
         if not progress_policy.done:
             progress_policy.done = True
@@ -363,12 +381,12 @@ def selftest() -> int:
         return _wrong_edit()
     progress_policy.done = False
     ep_progress = grade_run(progress_policy)
-    ok("progress_rung_recorded", ep_progress["grade"]["ladder"] == 0.6,
+    ok("progress_rung_recorded", ep_progress["grade"]["ladder"] == 0.2,
        str(ep_progress["grade"]))
-    ok("progress_no_submit_banks_zero", ep_progress["grade"]["reward"] == 0.0,
-       "no submit -> nothing banked, however good the rung")
+    ok("progress_no_submit_keeps_ladder", ep_progress["grade"]["reward"] == 0.2,
+       "the rung stands alone; nothing is gated away")
 
-    print("== §4.2b gate: progress, check re-run, then submit -> 0.6 banked")
+    print("== §4.2b (round 5): progress + check + submit = 0.2 + 0.4 + 0.1 = 0.7")
     def progress_ok(messages):
         n = progress_ok.n
         progress_ok.n += 1
@@ -383,13 +401,13 @@ def selftest() -> int:
     gok = grade_run(progress_ok)["grade"]
     ok("submit_after_check_verified",
        gok["verified"] is True and gok["submitted"] is True, str(gok))
-    ok("submit_after_check_banks_rung",
-       gok["reward"] == 0.6 and gok["ladder"] == 0.6, str(gok))
-    ok("bank_beats_no_submit", gok["reward"] > ep_progress["grade"]["reward"],
+    ok("bonuses_stack",
+       abs(gok["reward"] - 0.7) < 1e-9 and gok["ladder"] == 0.2, str(gok))
+    ok("bonuses_beat_bare_rung", gok["reward"] > ep_progress["grade"]["reward"],
        f"{gok['reward']} vs {ep_progress['grade']['reward']}")
 
-    print("== §4.2b gate: progress + submit but NEVER re-running the check -> 0.0 "
-          "(round 3 banked 51/54 submits it never re-tested)")
+    print("== §4.2b (round 5): submit without re-running the check still banks its "
+          "rung + termination bonus = 0.2 + 0.4 = 0.6 (round 4 zeroed all of this)")
     def progress_noverify(messages):
         n = progress_noverify.n
         progress_noverify.n += 1
@@ -401,11 +419,29 @@ def selftest() -> int:
     progress_noverify.n = 0
     gnv = grade_run(progress_noverify)["grade"]
     ok("submit_without_check_not_verified", gnv["verified"] is False, str(gnv))
-    ok("submit_without_check_banks_zero",
-       gnv["reward"] == 0.0 and gnv["ladder"] == 0.6, str(gnv))
+    ok("submit_without_check_still_banks",
+       abs(gnv["reward"] - 0.6) < 1e-9 and gnv["ladder"] == 0.2, str(gnv))
 
-    print("== §4.2b gate: a *passing* fix that never submits still scores 0.0 "
-          "(an unsubmitted episode is a timeout, not a win)")
+    print("== §4.2b (round 5): re-running the check pays even without submit "
+          "(the dense signal that makes the verbatim check learnable)")
+    def check_no_submit(messages):
+        n = check_no_submit.n
+        check_no_submit.n += 1
+        if n == 0:
+            return _view()
+        if n == 1:
+            return _wrong_edit()
+        if n == 2:
+            return _bash(task.check_cmd)
+        return {"text": "still failing, I think.", "stopped": True, "calls": []}
+    check_no_submit.n = 0
+    gcn = grade_run(check_no_submit)["grade"]
+    ok("check_bonus_without_submit",
+       gcn["verified"] is True and gcn["submitted"] is False
+       and abs(gcn["reward"] - 0.3) < 1e-9, str(gcn))
+
+    print("== §4.2b (round 5): a *passing* fix that never submits keeps the pass "
+          "rung (1.0) but forgoes the termination bonus (1.5 -> 1.0)")
     def fix_no_submit_policy(messages):
         n = fix_no_submit_policy.n
         fix_no_submit_policy.n += 1
@@ -420,8 +456,10 @@ def selftest() -> int:
     fix_no_submit_policy.n = 0
     gns = grade_run(fix_no_submit_policy)["grade"]
     ok("pass_no_submit_check_passes", gns["check"]["passed"] is True, str(gns["check"]))
-    ok("pass_no_submit_banks_zero", gns["reward"] == 0.0 and gns["tier"] == "pass",
+    ok("pass_no_submit_keeps_ladder", gns["reward"] == 1.0 and gns["tier"] == "pass",
        str(gns))
+    ok("terminate_is_worth_more_when_solved", oracle_reward > gns["reward"],
+       f"oracle {oracle_reward} vs timeout {gns['reward']}")
 
     print()
     if fails:
