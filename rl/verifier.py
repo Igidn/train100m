@@ -52,9 +52,11 @@ for _p in (_HERE, _ROOT):
         sys.path.insert(0, _p)
 
 try:
-    from .agent_env import generate_task, parse_calls, run_check, run_episode
+    from .agent_env import (calls_with_results, generate_task, mutation_applied,
+                            parse_calls, run_check, run_episode)
 except ImportError:  # python rl/verifier.py
-    from agent_env import generate_task, parse_calls, run_check, run_episode
+    from agent_env import (calls_with_results, generate_task, mutation_applied,
+                           parse_calls, run_check, run_episode)
 
 # the ladder (§4.2) — one place, so grpo_report and the trainer read the same cut.
 # Round 5 de-farmed it: `progress` (an edit that *moved* the check output but still
@@ -129,31 +131,54 @@ def _read_before_edit(messages) -> bool:
     return all(p in viewed for p in mutated if p)
 
 
-def _ran_check_after_last_edit(messages, check_cmd) -> bool:
-    """Did the episode re-run the failing check after its last edit?
+def _compiles(text) -> bool:
+    if text is None:
+        return False
+    try:
+        compile(text, "<edited>", "exec")
+        return True
+    except SyntaxError:
+        return False
 
-    This is exactly `agent_rollout`'s `verify_with_check`, computed the same way, so
-    the reward and the G4 metric measure one thing. `submit` is only banked when this
-    holds: an answer declared without re-running the check on it is the round-3
-    failure (51/54 submits were never-re-tested).
+
+def _broke_syntax(source_changed) -> str | None:
+    """The first changed source file the episode left unparseable.
+
+    Round 5's `progress` rung paid 0.2 for "the check output moved". Deleting a
+    line moves the output, because the file stops importing: 19 of 27 non-passing
+    progress episodes in the R5 holdout were `IndentationError`/`SyntaxError`.
+    Any changed (or newly created) `.py` that does not `compile()` is not progress,
+    however it got that way — a rejected `str_replace` cannot reach here, but a
+    `bash` redirect or an `insert` into the wrong place can.
+    """
+    for rel, (_before, after) in (source_changed or {}).items():
+        if rel.endswith(".py") and not _compiles(after):
+            return rel
+    return None
+
+
+def _ran_check_after_last_edit(messages, check_cmd) -> bool:
+    """Did the episode re-run the failing check after its last *successful* edit?
+
+    This is `agent_rollout`'s `verify_with_check`, computed the same way, so the
+    reward and the G4 metric measure one thing. Round 5 counted a `str_replace`
+    *call*: 30 of 66 R5 "verified" episodes had no successful edit at all, so the
+    metric was re-running the verbatim check on an unchanged file. Now the edit
+    must have been applied (`mutation_applied`), not merely attempted.
     """
     cmd = (check_cmd or "").strip()
     if not cmd:
         return False
-    calls = []
-    for m in messages or []:
-        if m.get("role") != "assistant":
-            continue
-        calls.extend(parse_calls(m.get("content") or ""))
+    seq = calls_with_results(messages)
     last_edit = -1
-    for i, (name, args) in enumerate(calls):
+    for i, (name, args, res) in enumerate(seq):
         if name == "str_replace_editor" and args.get("command") in (
-                "create", "str_replace", "insert"):
+                "create", "str_replace", "insert") and mutation_applied(args, res):
             last_edit = i
     if last_edit < 0:
         return False
     return any(name == "bash" and str(args.get("command", "")).strip() == cmd
-               for name, args in calls[last_edit + 1:])
+               for name, args, _res in seq[last_edit + 1:])
 
 
 def _changed_among(changed, files) -> dict:
@@ -200,6 +225,7 @@ def grade(task, sb, episode) -> dict:
         anti.append("edited_tests_only")
 
     initial = (episode or {}).get("initial_check") or {}
+    broke = _broke_syntax(source_changed)
     progressed = (visible["output"] != initial.get("output", "")) and not visible["passed"]
     correct_file = bool(task.fix) and task.fix["path"] in source_changed
     edited = bool(source_changed)
@@ -212,6 +238,10 @@ def grade(task, sb, episode) -> dict:
         ladder, tier = R_NONE, "anti_hack"
     elif visible["passed"]:
         ladder, tier = R_PASS, "pass"
+    elif broke:
+        # a deletion is not progress: the check output moved because the file
+        # stopped importing, and round 5 paid 0.2 for exactly that.
+        ladder, tier = R_NONE, "broke_syntax"
     elif progressed:
         ladder, tier = R_PROGRESS, "progress"
     elif correct_file:
@@ -228,13 +258,18 @@ def grade(task, sb, episode) -> dict:
     # §4.5 holds: a do-nothing immediate submit has no edit, so `ladder` is 0 and the
     # termination bonus does not fire. Anti-hack stays 0.0 flat (it never reaches the
     # ladder).
+    #
+    # Round-6 correction: R_CHECK now also requires `ladder > 0`. Paid on `verified`
+    # alone it was a free 0.1 for any episode that re-ran the verbatim check — even
+    # with no successful edit (232 R5 training episodes and 30/90 "live" G0 groups
+    # were live only because of it).
     if anti:
         reward = R_NONE
     else:
         reward = ladder
         if submitted and ladder > 0:
             reward += R_TERM
-        if verified:
+        if verified and ladder > 0:
             reward += R_CHECK
 
     return {
@@ -460,6 +495,39 @@ def selftest() -> int:
        str(gns))
     ok("terminate_is_worth_more_when_solved", oracle_reward > gns["reward"],
        f"oracle {oracle_reward} vs timeout {gns['reward']}")
+
+    print("== round 6: breaking the source is not progress (round 5 paid 0.2 here)")
+    def break_policy(messages):
+        n = break_policy.n
+        break_policy.n += 1
+        if n == 0:
+            return _bash(f"echo 'def f(' > {path}")
+        if n == 1:
+            return _bash(task.check_cmd)
+        return _submit()
+    break_policy.n = 0
+    gbr = grade_run(break_policy)["grade"]
+    ok("break_tier", gbr["tier"] == "broke_syntax", str(gbr["tier"]))
+    ok("break_zero", gbr["reward"] == 0.0, str(gbr["reward"]))
+
+    print("== round 6: a *failed* edit + check pays nothing (no free R_CHECK)")
+    def failed_edit_policy(messages):
+        n = failed_edit_policy.n
+        failed_edit_policy.n += 1
+        if n == 0:
+            return _view()
+        if n == 1:
+            return {"text": tc + json.dumps({"name": "str_replace_editor", "arguments": {
+                "command": "str_replace", "path": path,
+                "old_str": task.fix["old_str"]}}), "stopped": True, "calls": []}
+        if n == 2:
+            return _bash(task.check_cmd)
+        return _submit()
+    failed_edit_policy.n = 0
+    gfe = grade_run(failed_edit_policy)["grade"]
+    ok("failed_edit_not_verified", gfe["verified"] is False, str(gfe))
+    ok("failed_edit_zero", gfe["reward"] == 0.0, str(gfe["reward"]))
+    ok("failed_edit_tier", gfe["tier"] == "none", str(gfe["tier"]))
 
     print()
     if fails:

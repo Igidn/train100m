@@ -8,7 +8,7 @@ no clipping: the PPO ratio is 1 by construction. The loss is DAPO-shaped:
     pg  = -(A_i .detach() * logpi_i).sum() / total_tokens        # token-level
     r   = (logpi_ref - logpi) / n_i                              # per-token mean
     kl  = (K3(r) * n_i).sum() / total_tokens,  K3(r)=exp(r)-r-1
-    loss = pg + BETA_KL * kl
+    loss = pg + BETA_KL * kl + REPLAY_W * ce_replay              # REPLAY_W=0.01 default
 
 Three things this file is careful about, each a §3.1 trap:
 
@@ -196,6 +196,7 @@ def main():
     max_len = int(env("MAX_LEN", 3072))
     ce_chunk = int(env("CE_CHUNK", 2048))
     replay_frac = float(env("REPLAY_FRAC", 0.1))
+    replay_w = float(env("REPLAY_W", 0.01))
     ckpt_every = int(env("CKPT_EVERY", 100))
     report_every = int(env("REPORT_EVERY", 1))
     max_hours = float(env("MAX_HOURS", 11.0))
@@ -247,7 +248,8 @@ def main():
         print(f"[data] {len(rows)} rows / {len(groups)} live groups "
               f"(avg {avg_rows:.1f} rows/group, degenerate dropped) "
               f"beta_kl={beta_kl} lr={lr:g} rows/step={rows_per_step} world={world} "
-              f"micro={micro_bs} max_len={max_len} replay={replay_frac}", flush=True)
+              f"micro={micro_bs} max_len={max_len} replay={replay_frac} "
+              f"replay_w={replay_w}", flush=True)
         print(f"[plan] {total_steps} steps, {groups_needed} groups/step "
               f"({groups_per_rank}/rank), {world} rank(s)", flush=True)
 
@@ -349,7 +351,7 @@ def main():
                 continue
 
             opt.zero_grad(set_to_none=True)
-            agg, n_micro = {}, 0
+            agg, n_micro, rows_seen, adv_sum, adv_max = {}, 0, 0, 0.0, 0.0
             for j, (x, y, m, adv, ref, n) in enumerate(mbs):
                 ctx = (nullcontext() if j == len(mbs) - 1 else acc.no_sync(model))
                 with ctx:
@@ -362,20 +364,38 @@ def main():
                         if rb is not None:
                             xr, yr, mr = rb
                             rloss = model(xr, yr, loss_mask=mr, ce_chunk=ce_chunk)
-                            loss = loss + rloss
+                            # `loss` is token-normalised over the whole step
+                            # (denom = step_tokens), so an unscaled mean CE is a
+                            # 100x larger update: round 5's `pg` was ~1e-3 and its
+                            # replay CE ~0.12. Round 6 weights it like the regulariser
+                            # it is meant to be (REPLAY_W, default 0.01).
+                            loss = loss + replay_w * rloss
                             met["replay_loss"] = float(rloss.detach())
+                            met["loss"] = float(loss.detach())
                     if not torch.isfinite(loss):
                         met["skipped"] = 1.0
                         loss = loss * 0.0
                     acc.backward(loss / len(mbs))
                 n_micro += 1
+                # Round-6: aggregate the *step*, not the last microbatch. With
+                # MICRO_BS=1 the old code logged n_rows=1.0 and adv_abs_max as the
+                # mean of per-row maxima, so the R5 state file could not show the
+                # step's advantage spread at all.
+                rows_seen += int(met.get("n_rows", 0) or 0)
+                adv_sum += float(met.get("adv_abs_mean", 0.0)) * int(met.get("n_rows", 0) or 0)
+                adv_max = max(adv_max, float(met.get("adv_abs_max", 0.0)))
                 for k, v in met.items():
+                    if k in ("n_rows", "adv_abs_mean", "adv_abs_max"):
+                        continue
                     agg[k] = agg.get(k, 0.0) + v
             if any(p.grad is not None for p in model.parameters()):
                 acc.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             step += 1
             met = {k: v / max(1, n_micro) for k, v in agg.items()}
+            met["n_rows"] = float(rows_seen)
+            met["adv_abs_mean"] = adv_sum / max(1, rows_seen)
+            met["adv_abs_max"] = adv_max
             met["step"] = step
             hist.append(met)
             if main_proc and (step % report_every == 0 or step == 1

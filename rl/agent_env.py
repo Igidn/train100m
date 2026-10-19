@@ -226,14 +226,25 @@ class Sandbox:
         return {"path": str(p), "content": numbered, "total_lines": len(lines)}
 
     def create(self, path: str, file_text: str) -> dict:
+        if file_text is None:
+            raise ToolError("create: `file_text` is required (send \"\" for an empty file)")
         p = self.resolve(path)
         if p.exists():
             raise ToolError(f"file already exists: {path}")
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(file_text or "")
+        p.write_text(file_text)
         return {"path": str(p), "created": True}
 
     def str_replace(self, path: str, old_str: str, new_str: str) -> dict:
+        # A missing `new_str` used to default to "" and silently *delete* the
+        # matched span. That is the round-5 reward hack: the deletion breaks the
+        # file, the check output moves, and `progress` paid for it. The tool must
+        # refuse the call instead of guessing (RL_PLAN_2 §4.2 / §4.2b).
+        if not old_str:
+            raise ToolError("str_replace: `old_str` is required and must be non-empty")
+        if not new_str:
+            raise ToolError("str_replace: `new_str` is required and must be non-empty "
+                            "(this call would delete the matched text)")
         p = self.resolve(path)
         if not p.exists():
             raise ToolError(f"file not found: {path}")
@@ -244,6 +255,8 @@ class Sandbox:
         return {"path": str(p), "replaced": True}
 
     def insert(self, path: str, insert_line: int, new_str: str) -> dict:
+        if not new_str:
+            raise ToolError("insert: `new_str` is required and must be non-empty")
         p = self.resolve(path)
         if not p.exists():
             raise ToolError(f"file not found: {path}")
@@ -265,19 +278,39 @@ def execute_tool(name: str, args: dict, sb: Sandbox) -> dict:
     args = args or {}
     try:
         if name == "bash":
-            return sb.bash(str(args.get("command", "")))
+            cmd = str(args.get("command") or "")
+            if not cmd.strip():
+                raise ToolError("bash: `command` is required and must be non-empty")
+            return sb.bash(cmd)
         if name == "str_replace_editor":
             cmd = args.get("command")
+            # Required-argument checking is per command, not global: the schema
+            # only names `command`/`path`, so a `str_replace` with no `new_str`
+            # used to arrive here and delete text (round-5 hack).
+            if cmd in ("view", "create", "str_replace", "insert") and \
+                    not str(args.get("path") or "").strip():
+                raise ToolError(f"{cmd}: `path` is required")
             if cmd == "view":
                 return sb.view(str(args.get("path", "")), args.get("view_range"))
             if cmd == "create":
-                return sb.create(str(args.get("path", "")), args.get("file_text", ""))
+                if "file_text" not in args:
+                    raise ToolError("create: `file_text` is required (\"\" for an empty file)")
+                return sb.create(str(args.get("path", "")), args.get("file_text"))
             if cmd == "str_replace":
+                if "old_str" not in args or not str(args.get("old_str") or ""):
+                    raise ToolError("str_replace: `old_str` is required and must be non-empty")
+                if "new_str" not in args or not str(args.get("new_str") or ""):
+                    raise ToolError("str_replace: `new_str` is required and must be "
+                                    "non-empty (missing `new_str` would delete the match)")
                 return sb.str_replace(str(args.get("path", "")),
-                                      args.get("old_str", ""), args.get("new_str", ""))
+                                      str(args["old_str"]), str(args["new_str"]))
             if cmd == "insert":
+                if "insert_line" not in args:
+                    raise ToolError("insert: `insert_line` is required")
+                if "new_str" not in args or not str(args.get("new_str") or ""):
+                    raise ToolError("insert: `new_str` is required and must be non-empty")
                 return sb.insert(str(args.get("path", "")),
-                                 int(args.get("insert_line", 0)), args.get("new_str", ""))
+                                 int(args["insert_line"]), str(args["new_str"]))
             raise ToolError(f"unknown editor command: {cmd}")
         if name == "submit":
             return {"submitted": True}
@@ -292,6 +325,24 @@ def execute_tool(name: str, args: dict, sb: Sandbox) -> dict:
 # tier-0 micro tasks — tiny self-contained repos, verified by a plain
 # `python test_x.py` (no pytest, no deps). Parameterised so RL cannot memorise.
 # ---------------------------------------------------------------------------
+def _mod(rng, names) -> str:
+    """Pick a module name and keep it out of Python's own namespace.
+
+    `_t_index` used to be able to pick `collections`, so the generated repo did
+    `from collections import head` and hit the stdlib package instead of the
+    task's file: ~2% of every split was unsolvable by construction (oracle
+    audit: 981/1000 train, 977/1000 holdout; every failure was this).
+
+    The sanitising happens *after* `rng.choice`, so the RNG stream is unchanged
+    and every other seed's task stays byte-identical. Renaming must not re-roll
+    the corpus: the Stage-A pairs and the G4 baselines are keyed by seed.
+    """
+    m = rng.choice(names)
+    while m in sys.stdlib_module_names or m in sys.builtin_module_names:
+        m += "_mod"
+    return m
+
+
 def _variant(check_cmd: str, files: dict) -> dict:
     """A held-out re-check: the same defect, different literals (RL_PLAN_2 §4.3).
 
@@ -304,7 +355,7 @@ def _variant(check_cmd: str, files: dict) -> dict:
 
 
 def _t_constant(rng):
-    mod = rng.choice(["calc", "mathx", "ops", "arith", "core", "base"])
+    mod = _mod(rng, ["calc", "mathx", "ops", "arith", "core", "base"])
     fn = rng.choice(["add", "plus", "bump", "offset", "shift_by"])
     correct = rng.randint(3, 12)
     wrong = correct + rng.choice([-2, -1, 1, 2])
@@ -331,7 +382,7 @@ def _t_constant(rng):
 
 
 def _t_operator(rng):
-    mod = rng.choice(["calc", "mathx", "arith", "ops"])
+    mod = _mod(rng, ["calc", "mathx", "arith", "ops"])
     fn = rng.choice(["combine", "merge", "reduce", "apply"])
     right, wrongop = rng.choice([("*", "+"), ("-", "+"), ("+", "-"), ("/", "*")])
     a, b = rng.randint(2, 9), rng.randint(2, 9)
@@ -366,7 +417,7 @@ def _t_operator(rng):
 
 
 def _t_offbyone(rng):
-    mod = rng.choice(["seq", "range_util", "nums", "series"])
+    mod = _mod(rng, ["seq", "range_util", "nums", "series"])
     fn = rng.choice(["upto", "first_n", "count_to"])
     n = rng.randint(3, 8)
     n2 = rng.choice([x for x in range(2, 11) if x != n])
@@ -391,7 +442,7 @@ def _t_offbyone(rng):
 
 
 def _t_missing_return(rng):
-    mod = rng.choice(["util", "helpers", "tools", "support"])
+    mod = _mod(rng, ["util", "helpers", "tools", "support"])
     fn = rng.choice(["double", "scale", "shift"])
     k = rng.randint(2, 6)
     k2 = rng.choice([x for x in range(2, 8) if x != k])
@@ -417,7 +468,7 @@ def _t_missing_return(rng):
 
 
 def _t_comparison(rng):
-    mod = rng.choice(["pred", "checks", "valid", "guards"])
+    mod = _mod(rng, ["pred", "checks", "valid", "guards"])
     fn = rng.choice(["is_positive", "is_strict", "above_zero"])
     test = f"test_{mod}.py"
     files = {
@@ -441,7 +492,7 @@ def _t_comparison(rng):
 
 
 def _t_index(rng):
-    mod = rng.choice(["sequtil", "lists", "arrays", "collections"])
+    mod = _mod(rng, ["sequtil", "lists", "arrays", "collections"])
     fn = rng.choice(["first", "head", "pick", "front"])
     xs = rng.sample(range(10, 99), 3)
     ys = rng.sample(range(100, 199), 3)
@@ -465,7 +516,7 @@ def _t_index(rng):
 
 
 def _t_string(rng):
-    mod = rng.choice(["text", "strutil", "names", "fmt"])
+    mod = _mod(rng, ["text", "strutil", "names", "fmt"])
     fn = rng.choice(["greet", "label", "prefix"])
     word = rng.choice(["hello", "hi", "hey", "welcome"])
     bad = word.capitalize()
@@ -492,7 +543,7 @@ def _t_string(rng):
 
 
 def _t_default(rng):
-    mod = rng.choice(["config", "settings", "options", "defaults"])
+    mod = _mod(rng, ["config", "settings", "options", "defaults"])
     fn = rng.choice(["limit", "retries", "timeout", "batch"])
     correct = rng.randint(3, 9)
     wrong = correct + rng.choice([-2, 2])
@@ -518,7 +569,7 @@ def _t_default(rng):
 
 
 def _t_boolean(rng):
-    mod = rng.choice(["logic", "flags", "rules", "gates"])
+    mod = _mod(rng, ["logic", "flags", "rules", "gates"])
     fn = rng.choice(["either", "any_true", "enabled", "ok"])
     test = f"test_{mod}.py"
     files = {
@@ -542,7 +593,7 @@ def _t_boolean(rng):
 
 
 def _t_sort(rng):
-    mod = rng.choice(["order", "rank", "sortutil"])
+    mod = _mod(rng, ["order", "rank", "sortutil"])
     fn = rng.choice(["sorted_asc", "ascending", "in_order"])
     xs = rng.sample(range(1, 20), 4)
     ys = rng.sample(range(1, 20), 4)
@@ -569,8 +620,8 @@ def _t_sort(rng):
 def _t_multifile(rng):
     """A two-module defect: the fix lives in the helper the API imports. Exercises
     "the correct file is not the one named in the problem" without a real repo."""
-    helper = rng.choice(["util", "helpers", "support", "internal"])
-    api = rng.choice(["api", "service", "app", "core_lib"])
+    helper = _mod(rng, ["util", "helpers", "support", "internal"])
+    api = _mod(rng, ["api", "service", "app", "core_lib"])
     fn = rng.choice(["compute", "process", "transform"])
     correct = rng.randint(2, 9)
     wrong = correct + rng.choice([-1, 1])
@@ -692,6 +743,38 @@ def parse_calls(text: str) -> list[tuple[str, dict]]:
                 args = {"_raw": args}
             calls.append((obj["name"], args))
     return calls
+
+
+def calls_with_results(messages) -> list:
+    """[(name, args, result_dict), ...] in call order.
+
+    `run_episode` appends the assistant turn (carrying all of its calls) and then
+    one `role=tool` message per call, in order, so the pairing is positional. The
+    result matters: a `str_replace` that *failed* is still a call in the
+    transcript, and round 5 paid `R_CHECK` / counted `verify_with_check` for
+    re-running the check after exactly those.
+    """
+    out, pending = [], []
+    for m in messages or []:
+        role = m.get("role")
+        if role == "assistant":
+            pending = list(parse_calls(m.get("content") or ""))
+        elif role == "tool" and pending:
+            name, args = pending.pop(0)
+            raw = m.get("content")
+            try:
+                res = json.loads(raw) if isinstance(raw, str) else (raw or {})
+            except (TypeError, ValueError):
+                res = {}
+            out.append((name, args, res if isinstance(res, dict) else {}))
+    return out
+
+
+def mutation_applied(args, res) -> bool:
+    """A mutation call the sandbox actually applied (not an error value)."""
+    if not isinstance(res, dict) or res.get("error"):
+        return False
+    return bool(res.get("replaced") or res.get("created") or res.get("inserted"))
 
 
 def run_episode(task: MicroTask, policy, max_steps: int = MAX_STEPS,
@@ -907,6 +990,45 @@ def selftest() -> int:
         ok("unique.old_str", "error" in r and "exactly once" in r["error"])
     finally:
         sb.close()
+
+    print("== required arguments are per command (the round-5 deletion bug)")
+    sb = Sandbox({"c.py": "def f(x):\n    return x\n"})
+    try:
+        before = (sb.workdir / "c.py").read_text()
+        r = execute_tool("str_replace_editor", {"command": "str_replace",
+                                                "path": "c.py", "old_str": "return x"}, sb)
+        ok("arg.missing_new_str", "error" in r and "new_str" in r["error"], str(r)[:80])
+        ok("arg.missing_new_str_no_write",
+           (sb.workdir / "c.py").read_text() == before)
+        r = execute_tool("str_replace_editor", {"command": "str_replace",
+                                                "path": "c.py", "new_str": "return 1"}, sb)
+        ok("arg.missing_old_str", "error" in r and "old_str" in r["error"], str(r)[:80])
+        r = execute_tool("str_replace_editor", {"command": "str_replace", "path": "c.py",
+                                                "old_str": "return x", "new_str": ""}, sb)
+        ok("arg.empty_new_str", "error" in r and "new_str" in r["error"], str(r)[:80])
+        r = execute_tool("str_replace_editor", {"command": "insert",
+                                                "path": "c.py", "insert_line": 1}, sb)
+        ok("arg.insert_missing_new_str", "error" in r and "new_str" in r["error"], str(r)[:80])
+        r = execute_tool("str_replace_editor", {"command": "create", "path": "d.py"}, sb)
+        ok("arg.create_missing_file_text", "error" in r and "file_text" in r["error"], str(r)[:80])
+        r = execute_tool("str_replace_editor", {"command": "view"}, sb)
+        ok("arg.view_missing_path", "error" in r and "path" in r["error"], str(r)[:80])
+        ok("arg.good_edit", execute_tool("str_replace_editor", {"command": "str_replace",
+                                                                "path": "c.py",
+                                                                "old_str": "return x",
+                                                                "new_str": "return x + 1"},
+                                         sb).get("replaced") is True)
+    finally:
+        sb.close()
+
+    print("== generated module names never shadow the stdlib")
+    shadows = []
+    for s in range(1000):
+        for rel in generate_task(s).files:
+            base = rel[:-3] if rel.endswith(".py") else rel
+            if base in sys.stdlib_module_names or base in sys.builtin_module_names:
+                shadows.append((s, rel))
+    ok("gen.no_stdlib_shadow", not shadows, str(shadows[:5]))
 
     print()
     if fails:

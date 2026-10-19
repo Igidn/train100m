@@ -25,17 +25,18 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import socket
 import time
 import urllib.error
 import urllib.request
 
 try:
-    from .agent_env import (TOOLS, HOLDOUT_SEED0, generate_task, parse_calls,
-                            run_episode, system_prompt)
+    from .agent_env import (TOOLS, HOLDOUT_SEED0, calls_with_results, generate_task,
+                            mutation_applied, parse_calls, run_episode, system_prompt)
 except ImportError:  # run as a plain script (python rl/agent_rollout.py)
-    from agent_env import (TOOLS, HOLDOUT_SEED0, generate_task, parse_calls,
-                           run_episode, system_prompt)
+    from agent_env import (TOOLS, HOLDOUT_SEED0, calls_with_results, generate_task,
+                           mutation_applied, parse_calls, run_episode, system_prompt)
 
 OLLAMA = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434/api/chat")
 # A long Mac generation (100 tasks x G=16) holds the Ollama server for ~30 min;
@@ -46,6 +47,10 @@ TRANSIENT_RETRIES = int(os.environ.get("OLLAMA_RETRIES", "5"))
 DECLARED = {"bash": ("command",),
             "str_replace_editor": ("command", "path"),
             "submit": ()}
+# per-command required args: `command`/`path` alone let a `str_replace` with no
+# `new_str` count as valid (round 5). See `agent_env.execute_tool`.
+REQUIRED = {"view": (), "create": ("file_text",),
+            "str_replace": ("old_str", "new_str"), "insert": ("new_str",)}
 EDITOR_MUTATE = ("create", "str_replace", "insert")
 
 
@@ -55,18 +60,25 @@ class OllamaPolicy:
     env's run_episode reconstructs the trained `<|tool_call|>` history for us."""
 
     def __init__(self, model, url=OLLAMA, temp=0.7, top_p=0.95,
-                 num_predict=512, num_ctx=16384, timeout=600, send_tools=False):
+                 num_predict=512, num_ctx=16384, timeout=600, send_tools=False,
+                 seed=None):
         self.model, self.url, self.temp, self.top_p = model, url, temp, top_p
         self.num_predict, self.num_ctx, self.timeout = num_predict, num_ctx, timeout
+        self.seed = seed
         # The Modelfile template appends its own "Available tools" block when
         # `$.Tools` is set, and our system prompt already embeds the tool JSON —
         # sending both duplicates them (RL_PLAN §4.3, serving consistency).
         self.send_tools = send_tools
 
     def __call__(self, messages):
+        opts = {"temperature": self.temp, "top_p": self.top_p,
+                "num_predict": self.num_predict, "num_ctx": self.num_ctx}
+        # Ollama samples from a global RNG unless a seed is given, so without this
+        # two eval "seeds" were just disjoint task ranges, not replications.
+        if self.seed is not None:
+            opts["seed"] = int(self.seed)
         payload = {"model": self.model, "messages": messages, "stream": False,
-                   "options": {"temperature": self.temp, "top_p": self.top_p,
-                               "num_predict": self.num_predict, "num_ctx": self.num_ctx}}
+                   "options": opts}
         if self.send_tools:
             payload["tools"] = TOOLS
         body = json.dumps(payload).encode()
@@ -165,7 +177,22 @@ def _calls_in_order(ep):
     return seq
 
 
+def _calls_with_results(ep):
+    """[(name, args, result)] — the pairing `agent_env.calls_with_results` builds.
+
+    The result is needed so `verify_with_check` counts a check run after an edit
+    that was actually *applied*: round 5 accepted any `str_replace` call, so 30 of
+    the 66 "verified" R5 episodes had no successful edit at all.
+    """
+    return calls_with_results(ep.get("messages") or [])
+
+
 def _arg_ok(name, args):
+    """The call carries every argument its own command requires.
+
+    Round 5's check only named `command`/`path`, so `tool_valid=0.973` never
+    noticed a `str_replace` with no `new_str`. Required sets are per command.
+    """
     keys = DECLARED.get(name)
     if keys is None or not isinstance(args, dict):
         return False
@@ -173,9 +200,18 @@ def _arg_ok(name, args):
         v = args.get(k)
         if not isinstance(v, str) or not v.strip():
             return False
-    if name == "str_replace_editor" and args.get("command") not in \
-            ("view", "create", "str_replace", "insert"):
-        return False
+    if name == "str_replace_editor":
+        cmd = args.get("command")
+        if cmd not in ("view", "create", "str_replace", "insert"):
+            return False
+        need = REQUIRED.get(cmd, ())
+        for k in need:
+            v = args.get(k)
+            if not isinstance(v, str) or not v.strip():
+                return False
+        if cmd == "insert" and not (isinstance(args.get("insert_line"), int) or
+                                    str(args.get("insert_line", "")).strip().lstrip("-").isdigit()):
+            return False
     return True
 
 
@@ -192,10 +228,14 @@ def behavior_metrics(episodes):
     rbe_hit = rbe_den = 0
     vbs_hit = vbs_den = 0
     vbc_hit = vbc_den = 0
+    broken = 0
     for ep in episodes:
-        seq = _calls_in_order(ep)
+        seq = _calls_with_results(ep)
+        if re.search(r"(SyntaxError|IndentationError|TabError)",
+                     (ep.get("check") or {}).get("output") or ""):
+            broken += 1
         viewed, last_edit, last_bash = set(), -1, -1
-        for i, (name, args) in enumerate(seq):
+        for i, (name, args, res) in enumerate(seq):
             if name in DECLARED:
                 valid_d += 1
                 valid_n += 1 if _arg_ok(name, args) else 0
@@ -206,7 +246,11 @@ def behavior_metrics(episodes):
                 elif cmd in EDITOR_MUTATE:
                     rbe_den += 1
                     rbe_hit += 1 if p in viewed else 0
-                    last_edit = i
+                    # only an *applied* edit counts as "the last edit" — round 5
+                    # let a failed call stand in, which made verify_with_check
+                    # count a check over an unchanged file
+                    if mutation_applied(args, res):
+                        last_edit = i
             if name == "bash":
                 last_bash = i
         if last_edit >= 0:
@@ -216,7 +260,7 @@ def behavior_metrics(episodes):
             vbc_den += 1
             if check_cmd and any(
                     name == "bash" and str(a.get("command", "")).strip() == check_cmd
-                    for name, a in seq[last_edit + 1:]):
+                    for name, a, _r in seq[last_edit + 1:]):
                 vbc_hit += 1
 
     def rate(a, b):
@@ -230,6 +274,7 @@ def behavior_metrics(episodes):
         "read_before_edit": rate(rbe_hit, rbe_den),
         "verify_before_submit": rate(vbs_hit, vbs_den),
         "verify_with_check": rate(vbc_hit, vbc_den),
+        "syntax_broken_rate": rate(broken, n),
         "mean_steps": round(sum(e["steps"] for e in episodes) / n, 2),
     }
 
@@ -263,6 +308,8 @@ def main() -> int:
     ap.add_argument("--control", action="store_true")
     ap.add_argument("--keep", action="store_true")
     ap.add_argument("--temp", type=float, default=0.7)
+    ap.add_argument("--gen-seed", type=int, default=None,
+                    help="sampling seed for Ollama (makes eval runs repeatable)")
     ap.add_argument("--send-tools", action="store_true",
                     help="also pass tools= to Ollama (do NOT combine with the "
                          "system-embedded tools unless the Modelfile differs)")
@@ -283,7 +330,8 @@ def main() -> int:
     elif a.oracle:
         label, policy_fn = "oracle", oracle_policy
     else:
-        pol = OllamaPolicy(a.model, a.url, temp=a.temp, send_tools=a.send_tools)
+        pol = OllamaPolicy(a.model, a.url, temp=a.temp, send_tools=a.send_tools,
+                           seed=a.gen_seed)
         label, policy_fn = a.model, (lambda t: pol)
 
     print(f"rolling out {len(tasks)} tasks with {label} -> {a.out}")
@@ -320,6 +368,29 @@ def selftest() -> int:
     noop = run_episode(tasks[0], lambda m: {"text": "nothing", "stopped": True, "calls": []})
     ok("noop.check_false", noop["check"]["passed"] is False)
     ok("noop.steps=1", noop["steps"] == 1)
+
+    print("== round 6: a str_replace with no new_str is an invalid tool call")
+    path = tasks[0].fix["path"]
+    tc = "<" + "|tool_call|>"
+    bad = [run_episode(tasks[0], _steps_policy([
+        {"text": tc + json.dumps({"name": "str_replace_editor",
+                                  "arguments": {"command": "view", "path": path}}),
+         "stopped": True, "calls": []},
+        {"text": tc + json.dumps({"name": "str_replace_editor",
+                                  "arguments": {"command": "str_replace",
+                                                "path": path,
+                                                "old_str": tasks[0].fix["old_str"]}}),
+         "stopped": True, "calls": []},
+        {"text": tc + json.dumps({"name": "bash",
+                                  "arguments": {"command": tasks[0].check_cmd}}),
+         "stopped": True, "calls": []},
+    ]))]
+    mb = behavior_metrics(bad)
+    print("  bad:", mb)
+    ok("bad.tool_valid_lt_1", mb["tool_valid"] < 1.0, str(mb["tool_valid"]))
+    ok("bad.not_verified", mb["verify_with_check"] is None or mb["verify_with_check"] == 0.0,
+       str(mb["verify_with_check"]))
+    ok("bad.no_pass", mb["check_pass_rate"] == 0.0)
 
     print()
     if fails:

@@ -83,6 +83,7 @@ def report_samples(paths) -> int:
 
     # action mix, read off the completions
     actions = Counter()
+    editor_calls = empty_new = 0
     try:
         from build_pairs import HEADER, canonicalize
         for r in rows:
@@ -91,6 +92,11 @@ def report_samples(paths) -> int:
                 content = content[len(HEADER):]
             for tc in canonicalize({"role": "assistant", "content": content})["tool_calls"]:
                 actions[tc["name"]] += 1
+                a = tc.get("arguments") or {}
+                if tc["name"] == "str_replace_editor":
+                    editor_calls += 1
+                    if a.get("command") == "str_replace" and not str(a.get("new_str") or "").strip():
+                        empty_new += 1
     except Exception as e:  # noqa: BLE001
         print(f"  (action mix unavailable: {e})", file=sys.stderr)
 
@@ -114,7 +120,9 @@ def report_samples(paths) -> int:
     print(f"submit rate    : {len(sub_eps)/max(1,n_eps):.1%} of episodes ended on "
           f"submit (§4.2b — was the termination reward alive?)")
     print(f"verify rate    : {len(ver_eps)/max(1,n_eps):.1%} of episodes re-ran the "
-          f"check after their last edit (§4.2b — pays R_CHECK={0.1} on its own now)")
+          f"check after their last *successful* edit (R_CHECK is gated on a rung)")
+    print(f"destructive    : {empty_new}/{editor_calls} editor calls *emitted* a "
+          f"str_replace with no/empty `new_str` (the env rejects these now)")
     print(f"anti-hack (eps): {dict(anti) or '{}'}")
     print(f"turns/row group: {dict(sorted(turns.items()))}")
     if actions:

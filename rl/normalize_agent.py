@@ -81,6 +81,22 @@ def call(name: str, arguments: dict) -> tuple[str, dict]:
             raise Unmappable(f"str_replace_editor: command {cmd!r} unsupported")
         if "path" not in arguments:
             raise Unmappable("str_replace_editor: no path")
+        # Required args are per command. Without this a source row whose
+        # `<parameter=new_str>` was dropped/empty is normalised into a valid
+        # `str_replace` with no `new_str` — the exact call the env then deletes
+        # text with (and round 5 paid for).
+        if cmd == "create":
+            if "file_text" not in arguments:
+                raise Unmappable("str_replace_editor create: no file_text")
+        elif cmd == "str_replace":
+            for k in ("old_str", "new_str"):
+                if k not in arguments or not str(arguments.get(k) or "").strip():
+                    raise Unmappable(f"str_replace_editor str_replace: no {k}")
+        elif cmd == "insert":
+            if "new_str" not in arguments or not str(arguments.get("new_str") or "").strip():
+                raise Unmappable("str_replace_editor insert: no new_str")
+            if "insert_line" not in arguments:
+                raise Unmappable("str_replace_editor insert: no insert_line")
     if name == "bash" and not str(arguments.get("command", "")).strip():
         raise Unmappable("bash: empty command")
     if name == "submit":
@@ -416,6 +432,12 @@ def selftest() -> int:
         ({"name": "bash", "arguments": {"cmd": "ls"}}, "unknown arg"),
         ({"name": "execute_bash", "arguments": {"command": "ls"}}, "off-surface tool"),
         ({"name": "str_replace_editor", "arguments": {"command": "append", "path": "a"}}, "bad editor cmd"),
+        ({"name": "str_replace_editor", "arguments": {"command": "str_replace",
+                                                      "path": "a", "old_str": "x"}}, "missing new_str"),
+        ({"name": "str_replace_editor", "arguments": {"command": "insert",
+                                                      "path": "a"}}, "missing insert new_str"),
+        ({"name": "str_replace_editor", "arguments": {"command": "create",
+                                                      "path": "a"}}, "missing file_text"),
         ({"name": "bash", "arguments": {"command": "  "}}, "empty command"),
     ]:
         try:
