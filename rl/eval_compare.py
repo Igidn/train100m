@@ -27,14 +27,16 @@ for _p in (_HERE, _ROOT):
 from agent_rollout import behavior_metrics  # noqa: E402
 
 
-def evaluate(model, seed0, tasks, temp, out_dir):
+def evaluate(model, seed0, tasks, temp, out_dir, gen_seed=None):
     out = os.path.join(out_dir, f"eval-{model}-s{seed0}.jsonl")
     if not os.path.exists(out):
+        cmd = [sys.executable, os.path.join(_HERE, "agent_rollout.py"),
+               "--model", model, "--holdout", "--tasks", str(tasks),
+               "--seed0", str(seed0), "--temp", str(temp), "--out", out]
+        if gen_seed is not None:
+            cmd += ["--gen-seed", str(gen_seed)]
         print(f"[eval] {model} seed{seed0} -> {out}", flush=True)
-        subprocess.run([sys.executable, os.path.join(_HERE, "agent_rollout.py"),
-                        "--model", model, "--holdout", "--tasks", str(tasks),
-                        "--seed0", str(seed0), "--temp", str(temp),
-                        "--out", out], check=True)
+        subprocess.run(cmd, check=True)
     else:
         print(f"[eval] {model} seed{seed0} cached", flush=True)
     return [json.loads(line) for line in open(out) if line.strip()]
@@ -46,6 +48,9 @@ def main() -> int:
     ap.add_argument("--seeds", nargs="+", type=int, default=[0, 500])
     ap.add_argument("--tasks", type=int, default=100)
     ap.add_argument("--temp", type=float, default=1.0)
+    ap.add_argument("--gen-seed", type=int, default=1234,
+                    help="Ollama sampling seed; pinned so a table is reproducible "
+                         "(re-running the baseline is the only way to compare)")
     ap.add_argument("--out-dir", default=".")
     a = ap.parse_args()
     os.makedirs(a.out_dir, exist_ok=True)
@@ -53,12 +58,13 @@ def main() -> int:
     eps = {m: [] for m in a.models}
     for m in a.models:
         for s in a.seeds:
-            eps[m] += evaluate(m, s, a.tasks, a.temp, a.out_dir)
+            eps[m] += evaluate(m, s, a.tasks, a.temp, a.out_dir, a.gen_seed)
 
     cols = [("check_pass", "check_pass_rate"), ("terminate", "terminate_rate"),
             ("verify", "verify_with_check"), ("vbs", "verify_before_submit"),
             ("loop", "loop_rate"), ("steps", "mean_steps"),
-            ("valid", "tool_valid"), ("rbe", "read_before_edit")]
+            ("valid", "tool_valid"), ("rbe", "read_before_edit"),
+            ("broken", "syntax_broken_rate")]
     head = f"{'model':<18} {'n':>4} " + " ".join(f"{c:>9}" for c, _ in cols)
     print("\n" + head)
     print("-" * len(head))
