@@ -368,6 +368,22 @@ class RepoSandbox:
                     "CI": "1",
                     "GIT_TERMINAL_PROMPT": "0",
                     "PYTHONDONTWRITEBYTECODE": "1"})
+        # `pip install -e .` is *global*, and its `.pth` points at whichever
+        # tree was installed last. While every episode reinstalled, that was
+        # always the tree under test; now that the install marker works, a
+        # src-layout repo imports another instance's code while its own tests
+        # run. Measured: prepare two sqlfluff instances, replay the first, and
+        # its 34 tests execute against the second's `src` — 2 failures, the
+        # exact signature of the 9 gold replays the scale run refused.
+        # (sqlglot is immune by accident: `tests/__init__.py` makes pytest put
+        # the repo root on sys.path. sqlfluff has no `test/__init__.py`, so it
+        # falls through to the .pth.)
+        # PYTHONPATH precedes `.pth` entries, so the tree under test always wins
+        # — for the checker and for whatever `python -c` the model runs.
+        src = self.workdir / "src"
+        roots = ([str(src)] if src.is_dir() else []) + [str(self.workdir)]
+        old = os.environ.get("PYTHONPATH")
+        env["PYTHONPATH"] = os.pathsep.join(roots + ([old] if old else []))
         return env
 
     def bash(self, command: str, timeout: int = BASH_TIMEOUT) -> dict:
@@ -744,6 +760,17 @@ def selftest() -> int:
         v2 = sb.view("big.py", [1990, 2000])
         if "view truncated" in v2["content"] or "line 1999" not in v2["content"]:
             print(f"  FAIL view_range: {v2['content'][-80:]!r}")
+            bad += 1
+
+        # the tree under test must win over a stale global editable install
+        pp = sb._env()["PYTHONPATH"].split(os.pathsep)
+        if pp[0] != str(repo.resolve()):
+            print(f"  FAIL PYTHONPATH: {pp[:2]}")
+            bad += 1
+        (repo / "src").mkdir()
+        sb2 = RepoSandbox(repo)
+        if sb2._env()["PYTHONPATH"].split(os.pathsep)[0] != str((repo / "src").resolve()):
+            print(f"  FAIL PYTHONPATH src: {sb2._env()['PYTHONPATH'][:120]}")
             bad += 1
 
     if not _TEST_FILES_RE.search("src/action.test.js") or _TEST_FILES_RE.search("src/action.js"):

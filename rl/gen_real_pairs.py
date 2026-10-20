@@ -295,6 +295,18 @@ def run(args) -> int:
                 continue
             gold_ep = run_repo_episode(inst, gp, root=args.root,
                                        max_steps=len(steps) + 1)
+            if out_eps:
+                # Written before the verdict: a refused gold replay is the most
+                # informative row in the file, and it used to be the one row we
+                # did not keep (9 sqlfluff instances died that way invisibly).
+                out_eps.write(json.dumps({
+                    "instance_id": inst.instance_id, "role": "gold",
+                    "passed": bool(gold_ep["check"].get("passed")),
+                    "n_steps": gold_ep.get("steps"),
+                    "check": gold_ep.get("check"),
+                    "messages": gold_ep.get("messages"),
+                    "steps": steps,
+                }) + "\n")
             if _over_budget(gold_ep, max_chars):
                 stats["prompt_too_long"] += 1
                 print(f"  {inst.instance_id}: gold history over budget "
@@ -305,13 +317,6 @@ def run(args) -> int:
                       f"(steps={gold_ep.get('steps')}) — refusing to use it")
                 stats["gold_failed"] += 1
                 continue
-
-            if out_eps:
-                out_eps.write(json.dumps({
-                    "instance_id": inst.instance_id, "role": "gold",
-                    "passed": True, "n_steps": gold_ep.get("steps"),
-                    "check": gold_ep.get("check"), "steps": steps,
-                }) + "\n")
 
             if solved:
                 stats["student_solved"] += 1
