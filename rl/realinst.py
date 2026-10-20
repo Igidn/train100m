@@ -222,7 +222,14 @@ def make_instance(src_dir, cand, repo, lang=None) -> RepoInstance:
         lang=lang,
         fail_to_pass=extract_fail_to_pass(test_patch, lang),
         meta={"subject": cand["subject"], "date": cand["date"],
-              "gold_lines": cand["gold_lines"]},
+              "gold_lines": cand["gold_lines"],
+              # MiMo pins the *issue-time* tree inside its image (`/testbed`
+              # HEAD, e.g. 6728115 for format-code-task-001457); the row itself
+              # carries no commit and `ground_truth` is empty. We start at the
+              # fix's parent instead, which is SWE-bench's rule and makes the
+              # hidden-test files exactly the ones that change. Recorded so a
+              # MiMo-exact run is never confused with this one.
+              "base_rule": "fix-parent"},
     )
     return inst
 
