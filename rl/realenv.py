@@ -42,6 +42,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -178,6 +179,18 @@ def prepare(inst: RepoInstance, root=None, force=False, quiet=False) -> Path:
             cmd = cmd.replace("npm ci", "npm install", 1)
             print(f"  [install] {inst.instance_id}: ci refused, retrying `{cmd}`",
                   flush=True)
+            r = _run(cmd, cwd=dest, timeout=INSTALL_TIMEOUT)
+        if r.returncode != 0 and (dest / "package-lock.json").exists():
+            # npm 10 cannot even read a lockfile v1 in some trees ("Cannot read
+            # properties of null (reading 'edgesOut')" — hono). The lockfile is
+            # the input it chokes on, so it goes; `--no-package-lock` keeps a
+            # fresh one from appearing, and the deletion is committed below so
+            # the tree the model sees is still self-consistent.
+            print(f"  [install] {inst.instance_id}: lockfile unreadable, "
+                  f"regenerating", flush=True)
+            (dest / "package-lock.json").unlink()
+            cmd = cmd.replace("--no-audit", "--no-package-lock --no-audit", 1) \
+                if "--no-package-lock" not in cmd else cmd
             r = _run(cmd, cwd=dest, timeout=INSTALL_TIMEOUT)
         if r.returncode != 0:
             raise RepoError(f"install failed for {inst.instance_id}: "
@@ -431,6 +444,7 @@ class RepoSandbox:
 # grading
 # ---------------------------------------------------------------------------
 _JEST_JSON = ".jest-out.json"
+_PYTEST_XML = ".pytest-out.xml"
 
 
 def parse_jest(text: str) -> dict:
@@ -454,20 +468,51 @@ def parse_jest(text: str) -> dict:
             "failed": failed, "ran": ran}
 
 
+def parse_pytest(text: str) -> dict:
+    """pytest's `--junitxml` -> the same shape as `parse_jest`.
+
+    A collection error is reported by pytest as a `<testcase>` carrying an
+    `<error>`, so it lands in `failed` and `total` stays truthful — which is the
+    difference between "the fix's test fails" (gradable) and "the module does not
+    import" (an environment bug that must not pass for a real failure).
+    """
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return {}
+    ran, failed = [], []
+    for tc in root.iter("testcase"):
+        name = tc.get("name") or ""
+        cls = tc.get("classname") or ""
+        full = f"{cls}::{name}" if cls else name
+        ran.append(full)
+        if tc.find("failure") is not None or tc.find("error") is not None:
+            failed.append(full)
+    if not ran:
+        return {}
+    return {"passed": not failed, "total": len(ran), "failed": failed, "ran": ran}
+
+
 def parse_test_result(inst: RepoInstance, res: dict, repo_dir) -> dict:
     """The SWE-bench rule: the fix commit's tests must pass.
 
-    `check_cmd` is written so that a JSON report is the primary evidence and the
-    exit code is the fallback, because "the runner exited 0" is spoofable by a
-    model that deletes the test file (which `install_hidden_tests` has already
-    undone) and because a per-test view is what the pairs need.
+    `check_cmd` is written so that a machine-readable report is the primary
+    evidence and the exit code is the fallback, because "the runner exited 0" is
+    spoofable by a model that deletes the test file (which
+    `install_hidden_tests` has already undone) and because a per-test view is
+    what the pairs need. The pytest path exists because exit-code-only gating
+    cannot tell "the fix's test failed" from "the suite did not collect": the
+    first probe returned `n_tests=0->0` for every Python candidate, which would
+    have let a broken environment pass as a verified instance.
     """
-    out_file = Path(repo_dir) / _JEST_JSON
+    py = getattr(inst, "lang", "") == "py"
+    out_file = Path(repo_dir) / (_PYTEST_XML if py else _JEST_JSON)
     report = {}
     if out_file.exists():
         try:
-            report = parse_jest(out_file.read_text())
-        except OSError:
+            text = out_file.read_text()
+            report = parse_pytest(text) if py else parse_jest(text)
+        except (OSError, ET.ParseError):
             report = {}
     if report:
         passed = report["passed"]
@@ -608,6 +653,29 @@ def selftest() -> int:
 
     if parse_jest("not json") != {}:
         print("  FAIL parse_jest should ignore a missing report")
+        bad += 1
+
+    # pytest's junit report: a failing test, a passing test, and a collection
+    # error (which must land in `failed`, not vanish into an exit code)
+    rep = parse_pytest(
+        '<testsuites><testsuite name="s">'
+        '<testcase classname="tests.test_a" name="test_ok"/>'
+        '<testcase classname="tests.test_a" name="test_bad"><failure/></testcase>'
+        '<testcase classname="tests.test_b" name="tests.test_b"><error/></testcase>'
+        '</testsuite></testsuites>')
+    if rep.get("total") != 3 or rep.get("passed") is not False:
+        print(f"  FAIL parse_pytest: {rep}")
+        bad += 1
+    if rep.get("failed") != ["tests.test_a::test_bad", "tests.test_b::tests.test_b"]:
+        print(f"  FAIL parse_pytest failed names: {rep.get('failed')}")
+        bad += 1
+    rep = parse_pytest('<testsuites><testsuite><testcase classname="a" '
+                       'name="test_ok"/></testsuite></testsuites>')
+    if not rep.get("passed") or rep.get("total") != 1:
+        print(f"  FAIL parse_pytest pass case: {rep}")
+        bad += 1
+    if parse_pytest("<not xml") != {} or parse_pytest("<testsuites/>") != {}:
+        print("  FAIL parse_pytest should ignore an empty/unreadable report")
         bad += 1
 
     # a model that only edits tests is not a solver

@@ -41,7 +41,7 @@ for _p in (_HERE, _ROOT):
 
 from realenv import (SOURCE_EXT, RepoInstance, RepoSandbox, RepoTask,  # noqa: E402
                      apply_gold, is_test_file, prepare, repo_check, reset_tree,
-                     _git, _run)
+                     _PYTEST_XML, _git, _run)
 
 # ---------------------------------------------------------------------------
 # commit selection
@@ -122,7 +122,10 @@ def test_command(lang: str, test_files: list) -> str:
         return (f"npx jest --ci --silent --json "
                 f"--outputFile=.jest-out.json {files}")
     if lang == "py":
-        return f"python -m pytest -q {files}"
+        # `--junitxml` is the Python answer to jest's `--json`: without it the
+        # gate would only see an exit code and could not tell a failing test
+        # from a suite that never collected (the first probe's `n_tests=0->0`).
+        return f"python -m pytest -q --tb=no --junitxml={_PYTEST_XML} {files}"
     if lang == "go":
         return f"go test {' '.join(f'./{Path(f).parent}' for f in test_files)}"
     return f"echo 'no test runner for lang={lang}' && false"
@@ -178,6 +181,12 @@ def candidates(src_dir, window=None, branch=None, unit_only=True,
         if window and not (window[0] <= day <= window[1]):
             continue
         if SKIP_RE.search(subject):
+            continue
+        # A root commit has no parent, so there is no "before" to invert —
+        # stylelint's first commit ("nothing", 2014) is exactly that and made
+        # `git diff <sha>^` raise for the whole repo.
+        if not _git(src_dir, "rev-parse", "--verify", "--quiet", f"{sha}^",
+                    check=False).strip():
             continue
         files = [f for f in _git(src_dir, "show", "--name-only", "--format=", sha).splitlines() if f.strip()]
         source, tests = split_files(files)
