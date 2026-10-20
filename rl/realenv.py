@@ -130,7 +130,14 @@ def default_root() -> str:
 
 
 def _marker(inst, dest) -> Path:
-    return dest / ".realenv.json"
+    """Where `prepare` records that a tree is installed — *outside* the tree.
+
+    It used to live at `dest/.realenv.json`, which `reset_tree`'s `git clean -fd`
+    deletes: every episode then paid for a fresh `npm install`. On the scale run
+    that was three installs per instance (gate, student, gold) instead of one,
+    which is most of why 16 vault-action instances took 1.7 h.
+    """
+    return dest.parent / f".{dest.name}.realenv.json"
 
 
 def prepare(inst: RepoInstance, root=None, force=False, quiet=False) -> Path:
@@ -143,11 +150,12 @@ def prepare(inst: RepoInstance, root=None, force=False, quiet=False) -> Path:
     root = Path(root or default_root())
     dest = root / inst.instance_id
     marker = _marker(inst, dest)
-    if marker.exists() and not force:
+    if marker.exists() and dest.is_dir() and not force:
         state = json.loads(marker.read_text())
         if state.get("base_commit") == inst.base_commit and state.get("installed") == bool(inst.install_cmd):
             return dest
 
+    marker.unlink(missing_ok=True)
     if dest.exists():
         shutil.rmtree(dest, ignore_errors=True)
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -392,6 +400,23 @@ class RepoSandbox:
         if rng and len(rng) == 2:
             lo, hi = max(1, int(rng[0])), min(len(lines), int(rng[1]))
         numbered = "\n".join(f"{i:>4}: {lines[i-1]}" for i in range(lo, hi + 1))
+        # A real repo has files a micro-task never did: sqlglot's `parser.py`
+        # is 415 KB (~104k tokens), i.e. three times the model's whole window
+        # from a single `view`. Uncapped, that history was silently truncated
+        # from the left at serving time (`KVEngine`'s `p[-max_len:]`), so the
+        # model answered the tail of a source file with no system prompt and
+        # no issue — and the pair built from it taught that. Cap at the same
+        # budget as every other tool result and point at `view_range`.
+        if len(numbered) > MAX_OUTPUT:
+            kept, n = [], 0
+            for line in numbered.splitlines():
+                if n + len(line) + 1 > MAX_OUTPUT:
+                    break
+                kept.append(line)
+                n += len(line) + 1
+            numbered = "\n".join(kept) + (
+                f"\n... [view truncated at {MAX_OUTPUT} chars; this file has "
+                f"{len(lines)} lines — use view_range [start, end] for more]")
         return {"path": str(p), "content": numbered, "total_lines": len(lines)}
 
     def create(self, path: str, file_text: str) -> dict:
@@ -688,6 +713,38 @@ def selftest() -> int:
     if not g["edited_tests_only"] or g["passed"]:
         print(f"  FAIL edited_tests_only: {g}")
         bad += 1
+
+    # the install marker must sit outside the tree: `reset_tree` runs
+    # `git clean -fd`, which deleted it and made every episode reinstall
+    if _marker(inst, Path("/tmp/root/inst-x")).parent != Path("/tmp/root"):
+        print(f"  FAIL marker lives in the tree: {_marker(inst, Path('/tmp/root/inst-x'))}")
+        bad += 1
+
+    # a real repo's file can dwarf the context (sqlglot/parser.py: 415 KB), so
+    # `view` caps like every other tool result and says how to page
+    with tempfile.TemporaryDirectory() as td:
+        repo = Path(td) / "r"
+        repo.mkdir()
+        for cmd in (["git", "init", "-q"],
+                    ["git", "config", "user.email", "a@b"],
+                    ["git", "config", "user.name", "a"]):
+            subprocess.run(cmd, cwd=repo, check=True, capture_output=True)
+        (repo / "big.py").write_text(
+            "\n".join(f"line {i} " + "x" * 40 for i in range(2000)))
+        for cmd in (["git", "add", "-A"], ["git", "commit", "-qm", "x"]):
+            subprocess.run(cmd, cwd=repo, check=True, capture_output=True)
+        sb = RepoSandbox(repo)
+        v = sb.view("big.py")
+        if len(v["content"]) > MAX_OUTPUT + 200 or "view_range" not in v["content"]:
+            print(f"  FAIL view cap: {len(v['content'])} chars")
+            bad += 1
+        if v["total_lines"] != 2000:
+            print(f"  FAIL view total_lines: {v['total_lines']}")
+            bad += 1
+        v2 = sb.view("big.py", [1990, 2000])
+        if "view truncated" in v2["content"] or "line 1999" not in v2["content"]:
+            print(f"  FAIL view_range: {v2['content'][-80:]!r}")
+            bad += 1
 
     if not _TEST_FILES_RE.search("src/action.test.js") or _TEST_FILES_RE.search("src/action.js"):
         print("  FAIL test-file regex")

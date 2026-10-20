@@ -201,6 +201,17 @@ def call_kind(chosen_text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# context budget
+# ---------------------------------------------------------------------------
+def _chars(ep) -> int:
+    return sum(len(m.get("content") or "") for m in ep.get("messages") or [])
+
+
+def _over_budget(ep, max_chars: int) -> bool:
+    return _chars(ep) > max_chars
+
+
+# ---------------------------------------------------------------------------
 # main loop
 # ---------------------------------------------------------------------------
 def run(args) -> int:
@@ -214,8 +225,11 @@ def run(args) -> int:
     tok = None
     if args.tokenizer:
         from tokenizers import Tokenizer
-        tok = Tokenizer.from_file(args.tokenizer)
-        print(f"tokenizer: {args.tokenizer}")
+        path = args.tokenizer
+        if os.path.isdir(path):            # an HF export dir carries tokenizer.json
+            path = os.path.join(path, "tokenizer.json")
+        tok = Tokenizer.from_file(path)
+        print(f"tokenizer: {path}")
 
     policy = None
     if not args.gold_only:
@@ -231,7 +245,15 @@ def run(args) -> int:
     out_pairs = open(args.out, "w") if args.out else None
     out_eps = open(args.episodes, "w") if args.episodes else None
     stats = {"instances": 0, "student_solved": 0, "gold_failed": 0,
-             "pairs": 0, "no_pairs": 0, "error": 0}
+             "pairs": 0, "no_pairs": 0, "prompt_too_long": 0, "error": 0}
+    # The engine keeps the *last* `num_ctx` tokens and says nothing, so an
+    # episode whose history is over budget has already lost its system prompt
+    # and its issue statement by the time a turn is sampled. ~3.5 chars/token is
+    # the tokenizer's own ratio on this corpus; the guard is deliberately
+    # conservative because a false "too long" costs one instance and a false
+    # "fits" costs a corrupted pair.
+    max_chars = args.max_prompt_chars or int(args.num_ctx * 3.5)
+    print(f"context budget: {max_chars} chars (~{args.num_ctx} tok)")
     drops = {}
 
     for inst in insts:
@@ -246,6 +268,11 @@ def run(args) -> int:
             if policy is not None:
                 student_ep = run_repo_episode(inst, policy, root=args.root,
                                               max_steps=args.student_steps)
+                if _over_budget(student_ep, max_chars):
+                    stats["prompt_too_long"] += 1
+                    print(f"  {inst.instance_id}: student history over budget "
+                          f"({_chars(student_ep)} chars) — skipping instance")
+                    continue
                 solved = bool(student_ep["check"].get("passed"))
                 if out_eps:
                     out_eps.write(json.dumps({
@@ -264,6 +291,11 @@ def run(args) -> int:
                 continue
             gold_ep = run_repo_episode(inst, gp, root=args.root,
                                        max_steps=len(steps) + 1)
+            if _over_budget(gold_ep, max_chars):
+                stats["prompt_too_long"] += 1
+                print(f"  {inst.instance_id}: gold history over budget "
+                      f"({_chars(gold_ep)} chars) — skipping instance")
+                continue
             if not gold_ep["check"].get("passed"):
                 print(f"  {inst.instance_id}: GOLD REPLAY FAILED "
                       f"(steps={gold_ep.get('steps')}) — refusing to use it")
@@ -414,7 +446,11 @@ def main() -> int:
     ap.add_argument("--num-ctx", type=int, default=16384)
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--max-turns", type=int, default=8)
-    ap.add_argument("--max-prompt-tok", type=int, default=None)
+    ap.add_argument("--max-prompt-tok", type=int, default=14000,
+                    help="drop a pair whose rendered prompt exceeds this")
+    ap.add_argument("--max-prompt-chars", type=int, default=None,
+                    help="drop an instance whose episode history exceeds this "
+                         "(default: 3.5 x --num-ctx)")
     ap.add_argument("--tokenizer", default=None,
                     help="tokenizer.json; without it prompt length is not checked")
     ap.add_argument("--limit", type=int, default=None)

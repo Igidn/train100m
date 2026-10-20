@@ -156,15 +156,23 @@ class HFPolicy:
 
     def __init__(self, model_dir=None, repo=None, device=None, max_len=16384,
                  temp=0.7, top_p=0.95, max_tokens=512, seed=1234):
-        from sft.rollout import KVEngine, make_responder
+        from sft.rollout import KVEngine, make_responder, render_prefix
         self.engine = KVEngine(model_dir=model_dir, repo=repo, device=device,
                               max_len=max_len)
         self.respond = make_responder(self.engine, self.engine.tok,
                                       max_tokens=max_tokens, temp=temp,
                                       top_p=top_p, seed=seed)
+        self.render_prefix = render_prefix
+        self.max_len = max_len
 
     def __call__(self, messages):
         t0 = time.time()
+        # The engine truncates the prefix from the left (`p[-max_len:]`) without
+        # saying so, which on a real repo means the system prompt and the issue
+        # silently disappear. Measure the real length and report it, so the pair
+        # generator can refuse an instance instead of training on the tail of a
+        # source file. Encoding twice costs ~ms against a forward pass.
+        n_prompt = len(self.render_prefix(self.engine.tok, messages))
         text, stopped = self.respond(messages)
         text = text or ""
         # The header is part of the *completion* in training, so the engine
@@ -176,7 +184,9 @@ class HFPolicy:
             text = text[:-len(IM_END)]
         return {"text": text.strip("\n"), "stopped": bool(stopped),
                 "calls": [], "secs": time.time() - t0,
-                "prompt_tok": 0, "eval_tok": 0}
+                "prompt_tok": n_prompt,
+                "eval_tok": 0,
+                "truncated": n_prompt > self.max_len}
 
 
 def _steps_policy(steps):
