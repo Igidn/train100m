@@ -239,7 +239,11 @@ def run(args) -> int:
                               max_len=args.num_ctx, seed=args.seed,
                               max_tokens=args.max_tokens)
         else:
-            policy = OllamaPolicy(args.student, temp=args.temp,
+            # Accept the `ollama:` prefix that every other entry point uses, so
+            # `--student ollama:tinyballs-grpo6` is not sent to Ollama verbatim
+            # (it answers `invalid model name`, which reads like a server fault).
+            model = args.student[len("ollama:"):] if args.student.startswith("ollama:") else args.student
+            policy = OllamaPolicy(model, temp=args.temp,
                                   num_ctx=args.num_ctx, seed=args.seed)
 
     out_pairs = open(args.out, "w") if args.out else None
@@ -346,7 +350,13 @@ def run(args) -> int:
     for fh in (out_pairs, out_eps):
         if fh:
             fh.close()
-    print("\n" + json.dumps({**stats, "drops": drops}, indent=1))
+    summary = {**stats, "drops": drops, "max_prompt_chars": max_chars}
+    print("\n" + json.dumps(summary, indent=1))
+    # The kernel's own report only sees the pair file, so the reasons an
+    # instance produced nothing (no_signal / long_prompt / prompt_too_long)
+    # would otherwise live only in the log.
+    report_path = Path(args.out).with_suffix(".report.json")
+    report_path.write_text(json.dumps(summary, indent=1))
     return 0 if stats["error"] == 0 else 1
 
 

@@ -104,7 +104,14 @@ class OllamaPolicy:
                 break
             except urllib.error.HTTPError as e:
                 if 400 <= e.code < 500:      # our bug (bad model/args): do not loop
-                    raise
+                    # `HTTP Error 400: Bad Request` alone is unactionable; Ollama
+                    # puts the reason ("does not support tools", template parse
+                    # failure, ...) in the body.
+                    try:
+                        why = e.read().decode("utf-8", "replace")[:400]
+                    except Exception:  # noqa: BLE001
+                        why = ""
+                    raise RuntimeError(f"ollama {e.code} on {self.model}: {why}") from e
                 last_err = e
             except (urllib.error.URLError, socket.timeout, OSError) as e:
                 last_err = e
