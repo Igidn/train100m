@@ -37,6 +37,15 @@ try:
 except ImportError:  # run as a plain script (python rl/agent_rollout.py)
     from agent_env import (TOOLS, HOLDOUT_SEED0, calls_with_results, generate_task,
                            mutation_applied, parse_calls, run_episode, system_prompt)
+try:
+    from .agent_env import IM_END
+except ImportError:
+    from agent_env import IM_END
+
+# What training put in the *completion*: the SFT target starts at the header, so
+# a raw decode from a prompt ending on `<|im_end|>` returns it as part of the
+# generation (`sft.rollout.make_responder` does not add a generation prompt).
+ASSISTANT_HEADER = "<|im_start|>assistant\n"
 
 OLLAMA = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434/api/chat")
 # A long Mac generation (100 tasks x G=16) holds the Ollama server for ~30 min;
@@ -129,6 +138,45 @@ class OllamaPolicy:
         return {"text": content, "stopped": reason != "length", "calls": calls,
                 "secs": dt, "prompt_tok": resp.get("prompt_eval_count", 0),
                 "eval_tok": resp.get("eval_count", 0)}
+
+
+class HFPolicy:
+    """The same student, served in-process from a checkpoint (no daemon).
+
+    Ollama is the Mac's serving path. A Kaggle kernel has no daemon, and
+    pip-installing vLLM into the kernel's interpreter breaks the CUDA runtime
+    (`sft/vllm_phase.py` runs it as a child for that reason), so a kernel drives
+    the weights through the KV engine the SFT rollout already uses. Both paths
+    go through `sft/rollout.render_prefix`, so the ids the model sees are the
+    same on the Mac and on Kaggle — the deployment lesson from round 5.
+
+    `model_dir` must be HF format (`llama/export_hf.py` writes it); a bare
+    trainer `.pt` is a state dict, not a directory a tokenizer can be read from.
+    """
+
+    def __init__(self, model_dir=None, repo=None, device=None, max_len=16384,
+                 temp=0.7, top_p=0.95, max_tokens=512, seed=1234):
+        from sft.rollout import KVEngine, make_responder
+        self.engine = KVEngine(model_dir=model_dir, repo=repo, device=device,
+                              max_len=max_len)
+        self.respond = make_responder(self.engine, self.engine.tok,
+                                      max_tokens=max_tokens, temp=temp,
+                                      top_p=top_p, seed=seed)
+
+    def __call__(self, messages):
+        t0 = time.time()
+        text, stopped = self.respond(messages)
+        text = text or ""
+        # The header is part of the *completion* in training, so the engine
+        # hands it back; the env's history and `build_pairs.completion` both add
+        # it themselves, so leaving it in would double it.
+        if text.startswith(ASSISTANT_HEADER):
+            text = text[len(ASSISTANT_HEADER):]
+        if text.endswith(IM_END):
+            text = text[:-len(IM_END)]
+        return {"text": text.strip("\n"), "stopped": bool(stopped),
+                "calls": [], "secs": time.time() - t0,
+                "prompt_tok": 0, "eval_tok": 0}
 
 
 def _steps_policy(steps):

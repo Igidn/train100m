@@ -16,3 +16,4 @@ toktest/*.log
 
 .DS_Store
 
+rl/instances/

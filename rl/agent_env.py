@@ -778,7 +778,8 @@ def mutation_applied(args, res) -> bool:
 
 
 def run_episode(task: MicroTask, policy, max_steps: int = MAX_STEPS,
-                keep: bool = False, grader=None) -> dict:
+                keep: bool = False, grader=None, sandbox=None,
+                check_fn=None) -> dict:
     """Drive the sandbox against `policy(messages) -> dict`:
         {"text": str, "stopped": bool, "calls": [(name,args)], ...}
     `calls` may be empty; they are then parsed from `text`.
@@ -791,12 +792,19 @@ def run_episode(task: MicroTask, policy, max_steps: int = MAX_STEPS,
     `initial_check` is the check on the *pristine* tree, recorded before the
     policy moves: the graded ladder's "did the failure change" step (§4.2) is a
     comparison against it.
+
+    Two seams, both defaulted so the micro-task path is byte-identical:
+    `sandbox` supplies the tree (a real repo cannot be an in-memory dict, so
+    `rl/realenv.py` passes a git-backed one) and `check_fn` supplies the pass
+    rule (`run_check`'s `python test_x.py` + "OK" is a tier-0 convention, not a
+    general one — a real repo grades on its own test runner).
     """
-    sb = Sandbox(task.files, keep=keep)
+    sb = sandbox if sandbox is not None else Sandbox(task.files, keep=keep)
+    _check = check_fn or run_check
     try:
         messages = [{"role": "system", "content": system_prompt(str(sb.workdir))},
                     {"role": "user", "content": task.user_prompt(str(sb.workdir))}]
-        initial = run_check(task, sb)
+        initial = _check(task, sb)
         steps, calls_made, signatures = 0, [], []
         submitted = False
         last_stopped = True
@@ -834,7 +842,7 @@ def run_episode(task: MicroTask, policy, max_steps: int = MAX_STEPS,
         # loop = the same failing call signature seen twice or more
         err_sigs = [s for s in signatures if signatures.count(s) >= 2]
         loop = len(set(err_sigs)) > 0
-        check = run_check(task, sb)
+        check = _check(task, sb)
         ep = {
             "task_id": task.task_id, "tier": task.tier, "seed": task.task_id,
             "messages": messages, "steps": steps, "stopped": last_stopped,
